@@ -115,13 +115,17 @@ ncu --set full -o profiles/copy_transpose_profile \
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+**Note:** We are not accepting unsolicited pull requests during v0 stabilization. Please open an issue first and wait for maintainer approval before starting work.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for full details.
 
 ---
 
 ## Roadmap (v0.1 completion)
 
-* [ ] Week 0 copy/transpose: end-to-end correctness + benchmark + profile scripts
+* [x] Week 0 copy/transpose: end-to-end correctness + benchmark + profile scripts
 * [ ] Week 1 reductions: multiple variants, correctness + benchmark coverage
 * [ ] Week 2 online softmax: correctness + benchmark coverage + profiling notes
 * [ ] CI: run correctness on supported GPU runners; optional perf smoke checks
+
+See [ROADMAP.md](ROADMAP.md) for detailed breakdown and progress tracking.
