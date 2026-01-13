@@ -168,7 +168,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for full details.
 
 For kernel development workflow and architecture details, see:
 - [DEVELOPMENT.md](DEVELOPMENT.md) - Kernel development guide
-- [CLAUDE.md](CLAUDE.md) - AI assistant integration guide
 
 ---
 
