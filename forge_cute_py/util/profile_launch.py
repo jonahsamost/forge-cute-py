@@ -1,6 +1,6 @@
 import torch
 
-from forge_cute_py.kernels.reduce_sum import reduce_sum
+from forge_cute_py.ops.reduce_sum import reduce_sum
 
 def main():
     M, N = 4096, 4096
