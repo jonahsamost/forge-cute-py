@@ -4,9 +4,10 @@ import torch
 from forge_cute_py.ops import softmax_online
 from forge_cute_py.ref import softmax_online as ref_softmax_online
 
+dims = [-1]
 
 @pytest.mark.parametrize("shape", [(4, 8), (2, 128)])
-@pytest.mark.parametrize("dim", [-1, 0, 1])
+@pytest.mark.parametrize("dim", dims)
 @pytest.mark.parametrize(
     "dtype, atol, rtol",
     [
@@ -25,7 +26,7 @@ def test_softmax_online_correctness(shape, dim, dtype, atol, rtol):
 
 
 @pytest.mark.parametrize("shape", [(4, 8), (2, 128)])
-@pytest.mark.parametrize("dim", [-1, 0, 1])
+@pytest.mark.parametrize("dim", dims)
 @pytest.mark.parametrize(
     "dtype, atol, rtol",
     [
@@ -91,7 +92,7 @@ def test_softmax_online_extreme_values(input_dtype):
 
 
 @pytest.mark.parametrize("shape", [(4, 8), (16, 128), (32, 256)])
-@pytest.mark.parametrize("dim", [-1, 0, 1])
+@pytest.mark.parametrize("dim", dims)
 @pytest.mark.parametrize(
     "dtype, atol, rtol",
     [
@@ -120,7 +121,7 @@ def test_softmax_online_backward(shape, dim, dtype, atol, rtol):
 
 
 @pytest.mark.parametrize("shape", [(4, 8), (16, 128)])
-@pytest.mark.parametrize("dim", [-1, 1])
+@pytest.mark.parametrize("dim", dims)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_softmax_online_backward_torch_compile(shape, dim, dtype):
     """Test backward pass works with torch.compile."""

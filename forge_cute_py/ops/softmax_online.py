@@ -1,4 +1,7 @@
 import torch
+from cutlass import BFloat16, Float16, Float32
+import cutlass.cute as cute
+from forge_cute_py.kernels.softmax_online import SoftmaxOnline
 
 
 @torch.library.custom_op("forge_cute_py::_softmax_fwd", mutates_args={"out"})
@@ -21,13 +24,34 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor, dim: int = -1) -> None:
     dim = dim if dim >= 0 else x.ndim + dim
     assert dim in [0, 1], f"dim must be 0 or 1 for 2D tensors, got {dim}"
 
-    # For now, use reference implementation
-    # Future: call kernel implementation when available
-    from forge_cute_py.ref import softmax_online as softmax_online_ref
+    dtype_map = {
+        torch.float16: Float16,
+        torch.float32: Float32,
+        torch.bfloat16: BFloat16,
+    }
 
-    result = softmax_online_ref(x, dim=dim)
-    out.copy_(result)
+    if x.dtype not in dtype_map:
+        raise ValueError(f"Unsupported dtype: {x.dtype}")
 
+    cute_dtype = dtype_map[x.dtype]
+    compile_key = (cute_dtype, x.shape[1]) 
+
+    if compile_key not in _softmax_fwd.compile_cache:
+        m = cute.sym_int()
+        # n = cute.sym_int()
+        n = x.shape[1]
+        input_cute = cute.runtime.make_fake_compact_tensor(cute_dtype, (m, n), stride_order=(1, 0))
+        output_cute = cute.runtime.make_fake_compact_tensor(cute_dtype, (m, n), stride_order=(1, 0))
+        # Compile and cache the kernel
+        _softmax_fwd.compile_cache[compile_key] = cute.compile(
+            SoftmaxOnline(cute_dtype, n),
+            input_cute,
+            output_cute,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+
+    _softmax_fwd.compile_cache[compile_key](x, out)
 
 _softmax_fwd.compile_cache = {}
 
