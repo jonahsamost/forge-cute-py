@@ -27,10 +27,10 @@ def _reduce_sum(input: cute.Tensor, output: cute.Tensor, tv_layout, num_warps: i
 
     for tile_idx in range(ntiles):
         blk_coord = ((0, None), (bidx, tile_idx)) # all values in this [bidx, tile_idx] tile 
-        cta_tile = input[blk_coord]
-        thr_frag = cute.composition(cta_tile, tv_layout)
-        thr_src  = thr_frag[(tidx, None)]
-        acc += thr_src[0]
+        blk = input[blk_coord]
+        thr_frag = cute.composition(blk, tv_layout)
+        thr_val  = thr_frag[tidx, 0]
+        acc += thr_val
 
     acc = cute.arch.warp_reduction_sum(acc)
     if lane == 0:
@@ -43,19 +43,16 @@ def _reduce_sum(input: cute.Tensor, output: cute.Tensor, tv_layout, num_warps: i
         if lane == 0:
             output[bidx] = acc2
 
-
 @cute.jit
 def reduce_sum(x, output):
     num_warps = 16
     threads_per_block = 512
     M, N = x.shape
 
-    tiler_mn = (1, 2048)
-    gX = cute.zipped_divide(x, tiler_mn)
-
     thr_layout = cute.make_layout((threads_per_block,), stride=(1,))
-    val_layout = cute.make_layout((4,), stride=(1,))
-    _, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+    val_layout = cute.make_layout((1,), stride=(1,))
+    tiled_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+    gX = cute.zipped_divide(x, (1, tiled_mn[0]))
     
     _reduce_sum(gX, output, tv_layout, num_warps).launch(
         grid=(M, 1, 1),
@@ -64,19 +61,26 @@ def reduce_sum(x, output):
 
 
 def _invoke_reduce_sum(gInput, dim=-1):
-    a_ = from_dlpack(gInput)
+    # a_ = from_dlpack(gInput)
 
     sz = gInput.size(0) if dim == -1 else gInput.size(1)
     gOutput = torch.empty((sz,), dtype=gInput.dtype, device=gInput.device)
-    b_ = from_dlpack(gOutput)
+    # b_ = from_dlpack(gOutput)
 
-    kernel_fn = cute.compile(reduce_sum, a_, b_,)
-    kernel_fn(a_, b_)
+    key = (gInput.dtype, gInput.shape)
+    if key not in custom_cache:
+        kernel_fn = cute.compile(
+            reduce_sum,
+            from_dlpack(gInput),
+            from_dlpack(gOutput)
+        )
+        custom_cache[key] = kernel_fn
+    custom_cache[key](gInput, gOutput)
     return gOutput
 
 
 def simple_launch(dim=-1):
-    M, N = 1234, 4321
+    M, N = 512, 1024
 
     a = torch.randn(M, N, device="cuda", dtype=torch.float32)
     output = _invoke_reduce_sum(a, dim=-1)
@@ -84,6 +88,43 @@ def simple_launch(dim=-1):
     torch_sum = a.sum(dim=dim)
     assert torch.allclose(torch_sum, output, rtol=1e-4, atol=1e-4)
     print("Success!")
+
+
+
+def compare_torch_initial():
+    M, N = 4096, 4096
+
+    a = torch.randn(M, N, device="cuda", dtype=torch.float32)
+
+    # warm-up
+    for _ in range(10):
+        _invoke_reduce_sum(a, dim=-1)
+    torch.cuda.synchronize()
+    
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    start_event.record()
+    for _ in range(100):
+        _invoke_reduce_sum(a, dim=-1)
+    end_event.record()
+    torch.cuda.synchronize()
+    print(f"  cute dsl reduce sum: {start_event.elapsed_time(end_event) / 100:.3f} ms")
+
+    # warm-up torch
+    for _ in range(10):
+        _ = torch.sum(a, dim=-1)
+    torch.cuda.synchronize()
+    
+    start_event2 = torch.cuda.Event(enable_timing=True)
+    end_event2 = torch.cuda.Event(enable_timing=True)
+    
+    start_event2.record()
+    for _ in range(100):
+        _ = torch.sum(a, dim=-1)
+    end_event2.record()
+    torch.cuda.synchronize()
+    print(f"  torch kernel sum: {start_event2.elapsed_time(end_event2) / 100:.3f} ms")
 
 
 @cute.jit
@@ -103,7 +144,3 @@ def print_layout(mA):
     size = cute.size(gX, mode=[1])
     print(f"size: {size}")
     # render_tv_layout_svg(layout_tv, tiler_2d, "tv_layout.svg")
-
-M, N = 64, 64
-a = torch.randn(M, N, device="cuda", dtype=torch.float32)
-print_layout(a)

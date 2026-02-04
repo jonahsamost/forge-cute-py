@@ -1,6 +1,8 @@
 ### CuTe DSL Intro
 
-The stated goal of CUTLASS is to bridge the gap between productivity and performance for CUDA kernel development. The goal of CuTe DSL is to enable rapid prototyping and iteration on top of CUTLASS. So, the goal of this blogpost will be to try to rapidly get _you_ up to speed such that you can accomplish the stated goals of CuTe.
+The stated goal of CUTLASS is to bridge the gap between productivity and performance for CUDA kernel development. The goal of CuTe DSL is to enable rapid prototyping and iteration on top of CUTLASS.
+The goals of this blogpost are twofold. One is to try to rapidly get _you_ sped up such that you can accomplish the stated goals of CuTe.
+
 
 The first part of this blogpost will go into the how and why CuTe wants us to program they way it does and the second part will attempt to get across the mental model CuTe wants us to have while programming in CuTe.
 
@@ -8,11 +10,11 @@ The first part of this blogpost will go into the how and why CuTe wants us to pr
 Let's start with a simple question, how _should_ I be running my code?
 A lot of this example inspiration comes from Nvidia's cutlass example [here](https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/notebooks/elementwise_add.ipynb).
 
-But instead of doing a simple add, we'll be using `torch.sum` as our running motivation.
-The full code for this part can be found in part1.py.
+But instead of doing an add, we'll be using `torch.sum` as our running example.
 
 So, let's create just a simple kernel, for now only focusing on the last dimension and assume a contiguous, 2d tensor.
 ```python
+@cute.kernel
 def _reduce_sum_kernel(gA: cute.Tensor, output: cute.Tensor):
     smem_alloc = cutlass.utils.SmemAllocator()
     shmem = smem_alloc.allocate_tensor(cute.Float32, cute.make_layout((32,)))  # warp size
@@ -66,7 +68,8 @@ def _invoke_reduce_sum(gInput, dim=-1):
     return gOutput
 ```
 
-The code here is pretty self explanatory. There are a few things we will be going over later like `from_dlpack`,
+The code here is pretty self explanatory and reads very much like regular Cuda code.
+There are a few things we will be going over later like `from_dlpack`,
 `cute.compile`, and actually launching the kernel, but for now let's take that for granted.
 
 When you run `uv run python part1.py simple_launch`, we see `Success!`, but how fast is it? Let's compare versus torch.
@@ -77,13 +80,18 @@ Let's run `uv run python part1.py compare_torch_initial`.
   cute dsl reduce sum: 135.723 ms
   torch kernel add: 0.127 ms
 ```
-Ok, not great!
+Ok, not great! We're clearly doing something wrong.
 
 [Reading the docs](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_jit_caching.html#custom-caching-with-cute-compile) you quickly see that `cute.compile` bypasses caching in CuTe DSL and _always_
 performs compilation. There are also a [couple parameters](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html?#jit) we can control as it relates to JIT compilation.
 
 Ok, so on that [custom caching](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html?#jit) page in the docs, seemingly we only need a regular 
-dictionary and a key that maps us back to our compiled function. Let's try that.
+dictionary and a key that maps us back to our compiled function.
+
+We can assume that in some future state of this function, the key for that custom cache might be some tuple of
+shape, dtype, etc.
+
+Let's try that.
 
 ```python
 def _invoke_reduce_sum_with_cache(gInput, dim=-1):
@@ -107,7 +115,13 @@ def _invoke_reduce_sum_with_cache(gInput, dim=-1):
   torch kernel sum: 0.127 ms
 ```
 
-Well that really helped! But we haven't actually used any core abstractions that CuTe supports, namely [Layouts](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/01_layout.html#).
+Ok, caching really helped!
+
+
+
+
+Though our code looks more like Cuda written in python, rather than CuTe.
+But we haven't actually used any core abstractions that CuTe supports, namely [Layouts](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/01_layout.html#).
 A Layout, as described in those docs, "present a common interface to multidimensional array access that abstracts away the details of how the array’s elements are organized in memory".
 
 Ok, so let's make use of a simple [layout](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py#L2808).
@@ -178,6 +192,58 @@ zipped_divide(mA, tiler=(1,32))
 # Because tiler is (1,32)
 # we know that TileM=1, TileN=32
 # and RestM = M / 1 = M and RestN = N / 32 = ceil(N, 32)
+```
+
+And putting it altogether, we get something like this:
+```python
+@cute.kernel
+def _reduce_sum(input: cute.Tensor, output: cute.Tensor, tv_layout, num_warps: int):
+    smem_alloc = cutlass.utils.SmemAllocator()
+    shmem = smem_alloc.allocate_tensor(cute.Float32, cute.make_layout((32,)))
+
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    lane = cute.arch.lane_idx()
+    warp = cute.arch.warp_idx()
+
+    acc = cute.Float32(0.0)
+
+    _, mode1 = input.shape
+    ntiles = mode1[1]
+
+    for tile_idx in range(ntiles):
+        blk_coord = ((0, None), (bidx, tile_idx)) # all values in this [bidx, tile_idx] tile 
+        blk = input[blk_coord]
+        thr_frag = cute.composition(blk, tv_layout)
+        thr_val  = thr_frag[tidx, 0]
+        acc += thr_val
+
+    acc = cute.arch.warp_reduction_sum(acc)
+    if lane == 0:
+        shmem[warp] = acc
+    cute.arch.sync_threads()
+
+    if warp == 0:
+        acc2 = shmem[lane] if lane < num_warps else 0.0
+        acc2 = cute.arch.warp_reduction_sum(acc2)
+        if lane == 0:
+            output[bidx] = acc2
+
+@cute.jit
+def reduce_sum(x, output):
+    num_warps = 16
+    threads_per_block = 512
+    M, N = x.shape
+
+    thr_layout = cute.make_layout((threads_per_block,), stride=(1,))
+    val_layout = cute.make_layout((1,), stride=(1,))
+    tiled_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+    gX = cute.zipped_divide(x, (1, tiled_mn[0]))
+    
+    _reduce_sum(gX, output, tv_layout, num_warps).launch(
+        grid=(M, 1, 1),
+        block=(threads_per_block, 1, 1),
+    )
 ```
 
 
