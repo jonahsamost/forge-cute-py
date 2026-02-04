@@ -1,3 +1,4 @@
+from this import d
 import torch
 import cutlass
 import cutlass.cute as cute
@@ -5,6 +6,85 @@ import cuda.bindings.driver as cuda
 from cutlass import BFloat16, Float16, Float32
 from cutlass.cute.runtime import from_dlpack
 from cutlass import const_expr
+
+
+class SoftmaxOnlineBackward:
+    def __init__(self, dtype, N: int):
+        self.dtype = dtype
+        self.num_warps = 4
+        self.bits_read = 128
+        self.vec_load_size = self.bits_read // dtype.width
+        self.warp_size = 32
+        self.threads_per_block = self.num_warps * self.warp_size
+        self.N = N  # N is static at compile time, M is dynamic
+
+    @cute.jit
+    def __call__(self, dY: cute.Tensor, y: cute.Tensor, dx: cute.Tensor, stream=None):
+        blocks_over_N = cute.ceil_div(self.N, self.vec_load_size * self.warp_size)
+        tiler_mn = (  # full covering tile 
+            self.num_warps,
+            self.vec_load_size * self.warp_size * blocks_over_N
+        )
+
+        copy_op = cute.nvgpu.CopyUniversalOp()
+        copy_atom = cute.make_copy_atom(copy_op, self.dtype, num_bits_per_copy=self.bits_read)
+
+        thr_layout = cute.make_ordered_layout(
+            (self.num_warps, self.warp_size),
+            order=(1, 0)  # cols move faster
+        )
+        val_layout = cute.make_layout((1, self.vec_load_size))
+        tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+        blocks = cute.ceil_div(dY.shape[0], self.num_warps)
+        self.kernel(
+            dY, y, dx, tiler_mn, tiled_copy 
+        ).launch(
+            grid=(blocks, 1, 1),
+            block=(self.threads_per_block, 1, 1),
+            # stream=stream
+        )
+    
+    # type hints are not optional!!!!
+    @cute.kernel
+    def kernel(
+        self, dY: cute.Tensor, y: cute.Tensor, dX: cute.Tensor,
+        tiler_mn: cute.Shape, tiled_copy: cute.TiledCopy
+        ):
+        # Compute gradient (numerically stable)
+        # dot_product = (dy * y).sum(dim=dim, keepdim=True)
+        # result = y * (dy - dot_product)
+        # dx.copy_(result)
+
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+
+        dy_tile = cute.local_tile(dY, tiler_mn, (bidx, 0))
+        y_tile = cute.local_tile(y, tiler_mn, (bidx, 0))
+        dx_tile = cute.local_tile(dX, tiler_mn, (bidx, 0))
+
+        tidxSlice = tiled_copy.get_slice(tidx)
+        
+        dy_idx = tidxSlice.partition_S(dy_tile)
+        y_idx = tidxSlice.partition_S(y_tile)
+        dx_idx = tidxSlice.partition_D(dx_tile)
+
+        dy_regs = cute.make_rmem_tensor_like(dy_idx)
+        y_regs = cute.make_rmem_tensor_like(y_idx)
+
+        cute.autovec_copy(dy_idx, dy_regs)
+        cute.autovec_copy(y_idx, y_regs)
+
+        dy_data = dy_regs.load()
+        y_data = y_regs.load()
+
+        tidx_local_dp = dy_data * y_data
+        tidx_local_sum = tidx_local_dp.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
+        row_dp_sum = cute.arch.warp_reduction_sum(tidx_local_sum)
+
+        result = y_data * (dy_data - row_dp_sum)
+        dy_regs.store(result)
+        cute.autovec_copy(dy_regs, dx_idx)
 
 
 class SoftmaxOnlineLoop:
@@ -203,5 +283,40 @@ def benchmark(loopless=True):
     torch.cuda.synchronize()
     print(f"  torch.softmax dim=-1:  {(time.perf_counter() - start) * 10:.3f} ms")
 
-benchmark(loopless=False)
-benchmark(loopless=True)
+
+def bench_back():
+    dim = -1
+    M, N = 256, 256
+    dtype = torch.float32
+    dtype_map = {
+        torch.float16: Float16,
+        torch.float32: Float32,
+        torch.bfloat16: BFloat16,
+    }    
+    cute_dtype = dtype_map[dtype]
+    dy = torch.randn(M, N, device='cuda', dtype=dtype)
+    y = torch.randn(M, N, device='cuda', dtype=dtype)
+    dx = torch.randn(M, N, device='cuda', dtype=dtype)
+
+    m = cute.sym_int()
+    dy_cute = cute.runtime.make_fake_compact_tensor(
+        cute_dtype, (m, N), stride_order=(1, 0)
+    )
+    y_cute = cute.runtime.make_fake_compact_tensor(
+        cute_dtype, (m, N), stride_order=(1, 0)
+    ) 
+    dx_cute = cute.runtime.make_fake_compact_tensor(
+        cute_dtype, (m, N), stride_order=(1, 0)
+    ) 
+    softmax = SoftmaxOnlineBackward(dtype_map[dtype], N)
+    fn = cute.compile(
+        softmax, dy_cute, y_cute, dx_cute,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi", 
+    )
+    fn(dy, y, dx)
+
+# benchmark(loopless=False)
+# benchmark(loopless=True)
+
+# bench_back()
