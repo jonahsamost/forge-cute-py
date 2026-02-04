@@ -27,7 +27,7 @@ class ReduceSum:
         tiler_mn = (
             (self.num_warps, blocks_over_reduce_dim * self.warp_size) # fully cover dimension
             if self.dim == -1 else
-            (blocks_over_reduce_dim * self.threads_per_block, self.num_warps) # fully cover dimension
+            (blocks_over_reduce_dim * self.warp_size, self.num_warps) # fully cover dimension
         )
 
         copy_op = cute.nvgpu.CopyUniversalOp()
@@ -36,9 +36,8 @@ class ReduceSum:
         shape = (self.num_warps, self.warp_size) if self.dim == -1 else (self.warp_size, self.num_warps)
         order = (1, 0) if self.dim == -1 else (0, 1)
         thr_layout = cute.make_ordered_layout(shape, order)
-        print(f"thread layout: {thr_layout}")
         tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
-        print(f"tiled copy: {tiled_copy}")
+        # render_layout_svg(thr_layout, 'output.svg')
 
         blocks = cute.ceil_div(self.blocks, self.num_warps)
         self.kernel(
@@ -56,11 +55,9 @@ class ReduceSum:
         warp_idx = tidx // self.warp_size
         lane_idx = tidx % self.warp_size
 
-        gX = cute.local_tile(gInput, tiler_mn, (bidx, 0))
+        gX = cute.local_tile(gInput, tiler_mn, (bidx, 0) if self.dim == -1 else (0, bidx))
         tidxSlice = tiled_copy.get_slice(tidx)  
         tidxIndices = tidxSlice.partition_S(gX)
-        if bidx == 0 and tidx == 0:
-            print(f"sum: {tidxIndices}")
         tidxRegs = cute.make_rmem_tensor_like(tidxIndices)
         cute.autovec_copy(tidxIndices, tidxRegs)
         tidxValues = tidxRegs.load()
@@ -71,6 +68,7 @@ class ReduceSum:
 
 
 def benchmark(dim=0):
+    print(f"Testing dim: {dim}")
     import time
 
     M, N = 4096, 768
@@ -119,25 +117,26 @@ def benchmark(dim=0):
         max_diff = (output - expected).abs().max().item()
         print(f"         max diff: {max_diff}")
     
-    # print("\nBenchmarks:")
+    print("\nBenchmarks:")
     
-    # # Warmup
-    # for _ in range(10):
-    #     fn(x, output)
-    # torch.cuda.synchronize()
+    # Warmup
+    for _ in range(10):
+        fn(x, output)
+    torch.cuda.synchronize()
     
-    # # Benchmark our softmax
-    # start = time.perf_counter()
-    # for _ in range(100):
-    #     fn(x, output)
-    # torch.cuda.synchronize()
-    # print(f"  reduce sum cute dim=-1: {(time.perf_counter() - start) * 10:.3f} ms")
+    # Benchmark our softmax
+    start = time.perf_counter()
+    for _ in range(100):
+        fn(x, output)
+    torch.cuda.synchronize()
+    print(f"  reduce sum cute dim=-1: {(time.perf_counter() - start) * 10:.3f} ms")
     
-    # # Compare to PyTorch
-    # start = time.perf_counter()
-    # for _ in range(100):
-    #     _ = torch.nn.functional.softmax(x, dim=-1)
-    # torch.cuda.synchronize()
-    # print(f"  torch reduce sum dim=-1:  {(time.perf_counter() - start) * 10:.3f} ms")
+    # Compare to PyTorch
+    start = time.perf_counter()
+    for _ in range(100):
+        _ = torch.nn.functional.softmax(x, dim=-1)
+    torch.cuda.synchronize()
+    print(f"  torch reduce sum dim=-1:  {(time.perf_counter() - start) * 10:.3f} ms")
 
-benchmark()
+benchmark(dim=0)
+benchmark(dim=-1)
