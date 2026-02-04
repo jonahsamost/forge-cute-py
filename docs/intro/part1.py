@@ -1,10 +1,13 @@
+# import os
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+# os.environ['CUTLASS_CUDA_ARCH'] = '86'
+
 import argparse
 import time
 import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-
 
 custom_cache = {}
 
@@ -51,6 +54,16 @@ def reduce_sum(x: cute.Tensor, output: cute.Tensor):
         block=(threads_per_block, 1, 1),
     )
 
+@cute.jit
+def reduce_sum_dynamic(x: cute.Tensor, output: cute.Tensor):
+    num_warps = 4
+    threads_per_block = num_warps * 32
+    M, N = x.shape
+
+    _reduce_sum_kernel(x, output).launch(
+        grid=(M, 1, 1),
+        block=(threads_per_block, 1, 1),
+    )
 
 def _invoke_reduce_sum(gInput, dim=-1):
     a_ = from_dlpack(gInput)
@@ -75,7 +88,19 @@ def _invoke_reduce_sum_with_cache(gInput, dim=-1):
     if key not in custom_cache:
         custom_cache[key] = cute.compile(reduce_sum, a_, b_)
     fn = custom_cache[key]
-    fn(a_, b_)
+    fn(gInput, gOutput)
+    return gOutput
+
+
+def _invoke_reduce_sum_with_cache_dynamic(gInput, dim=-1):
+    sz = gInput.size(0) if dim == -1 else gInput.size(1)
+    gOutput = torch.empty((sz,), dtype=gInput.dtype, device=gInput.device)
+
+    key = f'reduce_sum_{gInput.dtype}'
+    if key not in custom_cache:
+        custom_cache[key] = cute.compile(reduce_sum_dynamic, gInput, gOutput)
+    fn = custom_cache[key]
+    fn(gInput, gOutput)
     return gOutput
 
 
@@ -88,6 +113,18 @@ def simple_launch(dim=-1):
     torch_sum = a.sum(dim=dim)
     assert torch.allclose(torch_sum, output, rtol=1e-4, atol=1e-4)
     print("Success!")
+
+
+def bug():
+    M, N = 4096, 4096
+    a = torch.randn(M, N, device="cuda", dtype=torch.float32)
+    initial = _invoke_reduce_sum_with_cache(a, dim=-1)
+    torch.allclose(initial, a.sum(dim=-1), rtol=1e-4, atol=1e-4)
+
+    M, N = 100, 300
+    b = torch.randn(M, N, device="cuda", dtype=torch.float32)
+    after = _invoke_reduce_sum_with_cache(b, dim=-1)
+    torch.allclose(after, b.sum(dim=-1), rtol=1e-4, atol=1e-4)
 
 
 def compare_torch_initial_cached():
@@ -182,5 +219,5 @@ def main():
         compare_torch_initial_cached()
 
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()

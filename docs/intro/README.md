@@ -1,16 +1,15 @@
-### CuTe DSL Intro
+# CuTe DSL Intro
 
-The stated goal of CUTLASS is to bridge the gap between productivity and performance for CUDA kernel development. The goal of CuTe DSL is to enable rapid prototyping and iteration on top of CUTLASS.
-The goals of this blogpost are twofold. One is to try to rapidly get _you_ sped up such that you can accomplish the stated goals of CuTe.
+The stated goal of CUTLASS is to bridge the gap between productivity and performance for CUDA kernel development.
+The goal of CuTe DSL is to enable rapid prototyping and iteration on top of CUTLASS.
+The goals of this blogpost are twofold.
+One is to try to rapidly get _you_ sped up such that you can accomplish the stated goals of CuTe.
+The second is to motivate why certain patterns exist in CuTe.
 
 
-The first part of this blogpost will go into the how and why CuTe wants us to program they way it does and the second part will attempt to get across the mental model CuTe wants us to have while programming in CuTe.
-
-
-Let's start with a simple question, how _should_ I be running my code?
+### `torch.sum` as our running example
+Let's start with a simple question, how do I even run code?
 A lot of this example inspiration comes from Nvidia's cutlass example [here](https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/notebooks/elementwise_add.ipynb).
-
-But instead of doing an add, we'll be using `torch.sum` as our running example.
 
 So, let's create just a simple kernel, for now only focusing on the last dimension and assume a contiguous, 2d tensor.
 ```python
@@ -69,6 +68,10 @@ def _invoke_reduce_sum(gInput, dim=-1):
 ```
 
 The code here is pretty self explanatory and reads very much like regular Cuda code.
+Given an MxN tensor, we will launch M blocks, where each group of threads in a block
+will collectively load, reduce, then store.
+
+Importantly, CuTe exposes several decorators, with the main ones being `@cute.jit` and `@cute.kernel`.
 There are a few things we will be going over later like `from_dlpack`,
 `cute.compile`, and actually launching the kernel, but for now let's take that for granted.
 
@@ -82,10 +85,13 @@ Let's run `uv run python part1.py compare_torch_initial`.
 ```
 Ok, not great! We're clearly doing something wrong.
 
+### Motivating compilation
+
 [Reading the docs](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_jit_caching.html#custom-caching-with-cute-compile) you quickly see that `cute.compile` bypasses caching in CuTe DSL and _always_
 performs compilation. There are also a [couple parameters](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html?#jit) we can control as it relates to JIT compilation.
 
-Ok, so on that [custom caching](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html?#jit) page in the docs, seemingly we only need a regular 
+Ok, so on the [custom caching](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_jit_caching.html#custom-caching-with-cute-compile)
+page in the docs, seemingly we only need a regular 
 dictionary and a key that maps us back to our compiled function.
 
 We can assume that in some future state of this function, the key for that custom cache might be some tuple of
@@ -117,8 +123,167 @@ def _invoke_reduce_sum_with_cache(gInput, dim=-1):
 
 Ok, caching really helped!
 
+But what happens if we do something like this:
+```python
+M, N = 1024, 1024
+a = torch.randn(M, N, device="cuda", dtype=torch.float32)
+initial = _invoke_reduce_sum_with_cache(a, dim=-1)
+assert torch.allclose(initial, a.sum(dim=-1), rtol=1e-4, atol=1e-4)
+
+M, N = 1024, 32
+b = torch.randn(M, N, device="cuda", dtype=torch.float32)
+after = _invoke_reduce_sum_with_cache(b, dim=-1)
+assert torch.allclose(after, b.sum(dim=-1), rtol=1e-4, atol=1e-4)
+```
+
+We know that after invoking `_invoke_reduce_sum_with_cache` once, the function will jit compile, and we can run it again
+without the overhead of compilation. But when you run that...
+
+```
+AcceleratorError: CUDA error: an illegal memory access was encountered
+```
+
+Hrm. Looking back up to our `_invoke_reduce_sum_with_cache` function, we see it will compile our `reduce_sum`
+function with two arguments, which are both passed through a call to `from_dlpack`. Reading the docs for 
+[from_dlpack](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/runtime.py#L746) aren't very 
+elucidating. It's purpose is to "from tensor object supporting __dlpack__() to a CuTe Tensor".
+
+Reading some docs we see that using `from_dlpack` results in a CuTe tensor with a [fully static layout](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/framework_integration.html#explicit-conversion-using-from-dlpack).
+Ok, this makes sense why changing the layout resulted in an access memory. How can easily define static vs dynamic layouts?
+
+The Nvidia [docs](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_dynamic_layout.html#static-layout) 
+offers good advice. In speaking to static layouts, they say
+"if we call the compiled function with a different shape of the input torch.Tensor,
+it would result in an unexpected result at runtime due to the mismatch of the type since
+compiled_func expects a cute.Tensor with" a different shape.
+
+Ah, so in order to support _any_ shapes for our kernel, we would just:
+```python
+@cute.jit
+def reduce_sum(x: cute.Tensor, output: cute.Tensor):
+    num_warps = 4
+    threads_per_block = num_warps * 32
+    M, N = x.shape
+
+    _reduce_sum_kernel(x, output).launch(
+        grid=(M, 1, 1),
+        block=(threads_per_block, 1, 1),
+    )
+
+def _invoke_reduce_sum_with_cache(gInput, dim=-1):
+    sz = gInput.size(0) if dim == -1 else gInput.size(1)
+    gOutput = torch.empty((sz,), dtype=gInput.dtype, device=gInput.device)
+
+    key = f'reduce_sum_{gInput.dtype}'
+    if key not in custom_cache:
+        custom_cache[key] = cute.compile(reduce_sum, gInput, gOutput)
+    fn = custom_cache[key]
+    fn(gInput, gOutput)
+    return gOutput
+
+> M, N = 64, 32
+> b = torch.randn(M, N, device="cuda", dtype=torch.float32)
+> after = _invoke_reduce_sum_with_cache(b, dim=-1)
+...
+DSLRuntimeError: DSLRuntimeError: expects argument #1 (x) to be <class 'cutlass.cute.typing.Tensor'>, but got <class 'torch.Tensor'>
+```
+
+Ok, it appears type hints are not _just_ hints in CuTe. But if we change the prototype of `reduce_sum` to
+```python
+@cute.jit
+def reduce_sum(x, output):
+```
+And then we try:
+
+```python
+M, N = 1024, 1024
+a = torch.randn(M, N, device="cuda", dtype=torch.float32)
+initial = _invoke_reduce_sum_with_cache_dynamic(a, dim=-1)
+assert torch.allclose(initial, a.sum(dim=-1), rtol=1e-4, atol=1e-4)
+
+M, N = 1024, 32
+b = torch.randn(M, N, device="cuda", dtype=torch.float32)
+after = _invoke_reduce_sum_with_cache_dynamic(b, dim=-1)
+assert torch.allclose(after, b.sum(dim=-1), rtol=1e-4, atol=1e-4)
+print("Success!")
+```
+We see Success! printed. 
+
+### Meeting in the middle
+
+But backing up a little bit, do we really just want static or dynamic? Assume some sort of best practices
+in choosing the key with which to match our compiled function (i.e. some tuple of the input's and output's shape, dtype, stride).
+For our `reduce_sum` example, for instance, all dimension-0 affects is how many blocks we launch. Making this dynamic 
+makes a lot of sense. But changing the inner dimension, might affect how the compiler chooses to emit it's code. Unrolling,
+vectorization width, tiling, etc. might result in code that has more branches or is just more generic for the average case.
+
+This is why CuTe wants you to take the [middle path](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/framework_integration.html#mark-the-tensor-s-layout-as-dynamic-with-mark-layout-dynamic).
+In our example, maybe we want the first dimension to be dynamic but the last dimension to be static.
+So, we would want something like this:
+```python
+cute_dtype = cutlass.Float32
+if compile_key not in compile_cache:
+    m = cute.sym_int()
+    n = x.shape[1]
+    input_cute = cute.runtime.make_fake_compact_tensor(cute_dtype, (m, n), stride_order=(1, 0))
+    output_cute = cute.runtime.make_fake_compact_tensor(cute_dtype, (m,))
+    fn = cute.compile(
+        reduce_sum_dynamic,
+        input_cute,
+        output_cute,
+    )
+    compile_cache[compile_key] = fn
+```
+
+What this says is:
+- `cute.sym_int()` says I want the first dimension to be dynamic
+- `cute.runtime.make_fake_compact_tensor` says the inputs to the function will be in a certain layout
+- `n = x.shape[1]` says I want one kernel variant per size of N
+- `stride_order=(1, 0)` says that dimension 1 is the fastest varying / contiguous dimension
+
+So, your compile_key might look something like `compile_key = (cute_dtype, x.shape[1], tuple(x.stride()))`
+
+But scrolling down that `Integration with Frameworks` page in the Nvidia docs we're on, we come to a section about [TVM FFI](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/framework_integration.html#leveraging-tvm-ffi-for-faster-pytorch-interop).
+Ok, they have me interested with "Faster JIT function invocation", so what is TVM-FFI and how can we use it?
+
+In the CuTe context, TVM-FFI is an optional calling interface for JIT functions that allows those functions to be called more efficiently.
+If you're interested in going deeper into TVM-FFI, check [this](https://www.youtube.com/watch?v=xMzcs6AqLVo) video out.
+
+Use TVM-FFI when you care about the overhead of calling a CuTe JIT-compiled function, or you want to call the compiled function with torch.Tensor inputs/outputs directly.
+
+For example, if you are benchmarking your kernels and you have an intuition that your kernel _should be_ faster but it's slower than torch's, and so
+you open up nsys and see "bubbles" between your kernels. The next kernel isn’t submitted until noticeably after the previous one completes.
+That gap is typically host-side work (Python/CuTe dispatch, conversions such as from_dlpack, etc). TVM-FFI is used to help reduce that overhead.
+
+So, let's use it, it couldn't be simpler and it's helpful!
+```
+@cute.jit
+def reduce_sum_dynamic_stream(x, output, stream=None):
+    num_warps = 4
+    threads_per_block = num_warps * 32
+    M, N = x.shape
+
+    _reduce_sum_kernel(x, output).launch(
+        grid=(M, 1, 1),
+        block=(threads_per_block, 1, 1),
+        stream=stream
+    )
+
+fn = cute.compile(
+    reduce_sum_dynamic_stream,
+    input_cute,
+    output_cute,
+    cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+    options="--enable-tvm-ffi",
+)
+```
+
+All we need to do is add the `options="--enable-tvm-ffi"` and we can also pass the current PyTorch stream as well.
 
 
+
+
+### Layouts
 
 Though our code looks more like Cuda written in python, rather than CuTe.
 But we haven't actually used any core abstractions that CuTe supports, namely [Layouts](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/01_layout.html#).
