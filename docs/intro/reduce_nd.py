@@ -1,5 +1,6 @@
 import torch
 import inspect
+import math
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
@@ -13,6 +14,7 @@ class ReduceSum:
     def __init__(self, shape, dtype, dim=-1):
         self.shape = shape
         self.dtype = dtype
+        self.bits_read = self.dtype.width
         self.num_warps = 4
         self.warp_size = 32
         self.threads_per_block = self.num_warps * self.warp_size
@@ -27,41 +29,49 @@ class ReduceSum:
         self.strides = strides
 
         self.before_shape = shape[:dim]
-        self.before_stride = strides[:dim]
+        self.before_stride = strides[0] if dim > 0 else 0
+        self.before_prod = math.prod(self.before_shape) if dim > 0 else 1
 
         self.after_shape = shape[dim + 1:]
-        self.after_stride = strides[dim + 1:]
+        self.after_stride = strides[-1] if dim < len(self.shape) - 1 else 0
+        self.after_prod = math.prod(self.after_shape) if dim < len(self.shape) - 1 else 1
         
         self.reduce_size = shape[dim]
         self.reduce_stride = strides[dim]
 
         self.output_shape = (*self.before_shape, *self.after_shape)
-        self.output_stride = (*self.before_stride, *self.after_stride)
+        self.blocks = math.prod(self.output_shape)
 
     @cute.jit
     def __call__(self, gInput: cute.Tensor, gOutput: cute.Tensor, stream: cuda.CUstream = None):
         blocks_over_reduce_dim = cute.ceil_div(self.reduce_size, self.warp_size)
 
-        val_layout = cute.make_layout((1, 1))
-        thr_layout = cute.make_layout(
-            (self.output_shape, self.reduce_size),
-            stride=(self.output_stride, self.reduce_stride)
+        copy_op = cute.nvgpu.CopyUniversalOp()
+        copy_atom = cute.make_copy_atom(copy_op, self.dtype, num_bits_per_copy=self.bits_read)
+
+        data_layout = cute.make_layout(
+            (self.before_prod, self.reduce_size, self.after_prod),
+            stride=(self.before_stride, self.reduce_stride, self.after_stride)
         ) 
-        tiled_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
-        gX = cute.zipped_divide(gInput, tiled_mn)
-        print(f"gx: {gX}")
+        gInputView = cute.make_tensor(gInput.iterator, data_layout)
 
-        # tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
-        # # render_layout_svg(thr_layout, 'output.svg')
+        thr_layout = cute.make_ordered_layout(
+            (self.warp_size, self.num_warps),
+            order=(0, 1)
+        )
+        val_layout = cute.make_layout((1, 1))
+        tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+        tiler_nd = (1, self.warp_size, self.num_warps)
 
-        # blocks = cute.ceil_div(self.blocks, self.num_warps)
-        # self.kernel(
-        #     gInput, gOutput, tiler_mn, tiled_copy
-        # ).launch(
-        #     grid=(blocks, 1, 1),
-        #     block=(self.threads_per_block, 1, 1),
-        #     stream=stream
-        # )
+        print(f"input: {gInputView}")
+        blocks = cute.ceil_div(self.blocks, self.num_warps)
+        self.kernel(
+            gInputView, gOutput, tiler_nd, tiled_copy
+        ).launch(
+            grid=(blocks, 1, 1),
+            block=(self.threads_per_block, 1, 1),
+            stream=stream
+        )
     
     @cute.kernel
     def kernel(self, gInput: cute.Tensor, gOutput: cute.Tensor, tiler_mn: cute.Shape, tiled_copy: cute.TiledCopy):
@@ -70,9 +80,18 @@ class ReduceSum:
         warp_idx = tidx // self.warp_size
         lane_idx = tidx % self.warp_size
 
-        gX = cute.local_tile(gInput, tiler_mn, (bidx, 0) if self.dim == -1 else (0, bidx))
+        out_idx = bidx * self.num_warps + warp_idx
+        before_idx = out_idx // self.after_prod
+        after_idx = out_idx % self.after_prod
+
+        gX = cute.local_tile(gInput, tiler_mn, (before_idx, None, after_idx))
         tidxSlice = tiled_copy.get_slice(tidx)  
         tidxIndices = tidxSlice.partition_S(gX)
+        if tidx == 0 and bidx == 0:
+            print(f"slice: {tidxSlice}")
+            print(f"ind: {tidxIndices}")
+        if bidx == 0 and tidx == 0:
+            print(f"tidx indices: {tidxIndices}")
         tidxRegs = cute.make_rmem_tensor_like(tidxIndices)
         cute.autovec_copy(tidxIndices, tidxRegs)
         tidxValues = tidxRegs.load()
@@ -96,6 +115,8 @@ def benchmark(dim=1):
     cute_dtype = dtype_map[dtype]
     
     x = torch.randn(a, b, c, device='cuda', dtype=dtype)
+    print(f"x shape: {x.shape}")
+    print(f"reduce over dim: {dim}")
     output_shape = list(x.shape)
     output_shape.pop(dim)
     output = torch.empty(output_shape, device=x.device, dtype=x.dtype)
