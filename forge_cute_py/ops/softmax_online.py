@@ -115,6 +115,9 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor, dim: 
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
+    _softmax_backward.compile_cache[compile_key](
+        dy, y, dx
+    )
 
 
 _softmax_backward.compile_cache = {}

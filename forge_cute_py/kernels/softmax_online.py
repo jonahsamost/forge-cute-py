@@ -42,7 +42,7 @@ class SoftmaxOnlineBackward:
         ).launch(
             grid=(blocks, 1, 1),
             block=(self.threads_per_block, 1, 1),
-            # stream=stream
+            stream=stream
         )
     
     # type hints are not optional!!!!
