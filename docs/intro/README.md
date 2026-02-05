@@ -838,3 +838,8 @@ Once you express how threads and data relate through layouts,
 the framework itself can do most of the mechanical work for you.
 
 There's a lot more to cover, but those are topics for another day.
+
+Thanks for reading!
+
+
+Written by [Jonah](https://x.com/jonahsamost)
