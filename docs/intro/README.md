@@ -1,14 +1,22 @@
 # CuTe DSL Intro
 
-The stated goal of CUTLASS is to bridge the gap between productivity and performance for CUDA kernel development.
-The goal of CuTe DSL is to enable rapid prototyping and iteration on top of CUTLASS.
+Hi! This intro assumes little to no experience programming with CuTe but it does assume experience with Cuda.
+Let's dive in!
+
+CuTe DSL is a python based higher-level abstraction built on top of Cutlass, which is itself a C++ template
+library that provides optimized operations for programming GPUs.
+
+The stated goal of Cutlass is to bridge the gap between productivity and performance for CUDA kernel development.
+The goal of CuTe DSL is to enable rapid prototyping and iteration on top of Cutlass.
+
+
 The goals of this blogpost are twofold.
 One is to try to rapidly get _you_ sped up such that you can accomplish the stated goals of CuTe.
 The second is to motivate why certain patterns exist in CuTe.
 
 
 ### `torch.sum` as our running example
-Let's start with a simple question, how do I even run code?
+Let's start with a simple question, how do I even run CuTe code?
 A lot of this example inspiration comes from Nvidia's cutlass example [here](https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/notebooks/elementwise_add.ipynb).
 
 
@@ -149,18 +157,19 @@ function with two arguments, which are both passed through a call to `from_dlpac
 [from_dlpack](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/runtime.py#L746) aren't very 
 elucidating. It's purpose is to convert us "from tensor object supporting __dlpack__() to a CuTe Tensor".
 
-Reading some docs we see that using `from_dlpack` results in a CuTe tensor with a [fully static layout](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/framework_integration.html#explicit-conversion-using-from-dlpack).
+Further reading, we see that using `from_dlpack` results in a CuTe tensor with a [fully static layout](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/framework_integration.html#explicit-conversion-using-from-dlpack).
 
-In speaking to [static layouts](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_dynamic_layout.html#static-layout), they say "if we call the compiled function with a different shape of the input torch.Tensor,
+In speaking to [static layouts](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_dynamic_layout.html#static-layout),
+the docs say "if we call the compiled function with a different shape of the input torch.Tensor,
 it would result in an unexpected result at runtime due to the mismatch of the type since
 compiled_func expects a cute.Tensor with" a different shape.
 
-Ok, so now this makes sense why changing the layout resulted in an access memory.
+Ok, so now this makes sense why changing the layout resulted in an access memory error.
 We told the CuTe compiler that we want a single shape, then gave it something different.
 
-How can we easily define static vs dynamic layouts?
+So, how can we easily define static vs dynamic layouts?
 
-Further down that page offers [advice](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_dynamic_layout.html#dynamic-layout)
+Further down that page offers [advice](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_dynamic_layout.html#dynamic-layout).
 
 In order to support _any_ shapes for our kernel, we would just:
 ```python
@@ -212,7 +221,7 @@ after = _invoke_reduce_sum_with_cache_dynamic(b, dim=-1)
 assert torch.allclose(after, b.sum(dim=-1), rtol=1e-4, atol=1e-4)
 print("Success!")
 ```
-We see Success! printed. 
+We see `Success!` printed. 
 
 ### Meeting in the middle
 
@@ -222,8 +231,9 @@ When deciding how to cache compiled kernels, we’ll typically use some combinat
 For our reduce_sum example, the outer dimension really only affects how many blocks we launch.
 Making that dimension dynamic makes a lot of sense, since it doesn’t change the structure of the generated code at all.
 The inner dimension is a different story.
-Changing that dimension can affect how the compiler chooses to generate code: unrolling, vectorization width, tiling strategies, etc.
-We might even want to generate different kernel variants optimized for different inner-dimension sizes, instead of relying on one generic version that works for everything.
+Changing that dimension can affect how the compiler chooses to generate code (i.e. unrolling, vectorization width, tiling strategies, etc.).
+We might even want to generate different kernel variants optimized for different inner-dimension sizes,
+instead of relying on one generic version that works for everything.
 
 This is why CuTe wants you to take the [middle path](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/framework_integration.html#mark-the-tensor-s-layout-as-dynamic-with-mark-layout-dynamic).
 In our example, maybe we want the first dimension to be dynamic but the last dimension to be static.
@@ -231,8 +241,8 @@ So, we would want something like this:
 ```python
 cute_dtype = cutlass.Float32
 if compile_key not in compile_cache:
-    m = cute.sym_int()
-    n = x.shape[1]
+    m = cute.sym_int()  # dynamic!
+    n = x.shape[1]  # static!
     input_cute = cute.runtime.make_fake_compact_tensor(cute_dtype, (m, n), stride_order=(1, 0))
     output_cute = cute.runtime.make_fake_compact_tensor(cute_dtype, (m,))
     fn = cute.compile(
@@ -259,6 +269,7 @@ If you're interested in going deeper into TVM-FFI, check [this](https://www.yout
 
 So, basically use TVM-FFI when you care about the overhead of calling a CuTe JIT-compiled function,
 or you want to call the compiled function with torch.Tensor inputs/outputs directly.
+TVM-FFI will handle the interoperability.
 
 For example, if you are benchmarking your kernels and you have an intuition that your kernel _should be_ faster but it's slower than torch's.
 So, you open up nsys and see "bubbles" between your kernels,
@@ -300,14 +311,18 @@ Not so fast!
 Looking back at the initial kernel we wrote, it looks more like Cuda than it does like CuTe.
 We haven't actually used any core abstractions that CuTe supports, namely [Layouts](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/01_layout.html#).
 A Layout, as described in those docs, "present a common interface to multidimensional array access that abstracts away the details of how the array’s elements are organized in memory".
+It's a clear statement, but the statement _itself_ feels a bit abstract.
 
-Ok, so let's make use of a simple [layout](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py#L2808).
-As you can see from those docs, a layout is defined mainly by a shape and an optional stride.
-
+As you can see from those docs, a [layout](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py#L2808)
+is defined mainly by a shape and an optional stride.
 Importantly, a layout is not itself data, it is the shape
 and indexing rule that allows one to know where the data is stored and how to traverse it.
+
 What is also interesting about layouts is that
 they are both [hierarchical](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/01_layout.html#hierarchical-access-functions) and compositional, which is to say, you can define a layout of layouts.
+
+Ok, so layouts _feel_ almost like tensor metadata.
+Except, its only the view/indexing portion (i.e. the shape and stride) without dtypes, pointers, etc.
 
 Ok, so given this, in order to layout-ify our reduce_sum kernel, we know we'd want _some_ sort of hierarchy.
 If we map our current kernel to this layout frame of mind,
@@ -427,11 +442,12 @@ Those were our visualizations.
 
 But we also have this other world, using functions like zipped_divide, that actually 
 take some tensor and decompose it into tiles and subtiles.
+Remember, we called `zipped_divide` like `gX = cute.zipped_divide(x, tiler_mn)`.
 
 What glues these two worlds together are functions like 
-make_layout_tv. In a function call like `tiler_mn, layout_tv = cute.make_layout_tv(thr_layout, val_layout)`
+`make_layout_tv`. In a function call like `tiler_mn, layout_tv = cute.make_layout_tv(thr_layout, val_layout)`
 tiler_mn answers a purely data question. Namely, how big of a tile does this thread/value configuration cover?
-Whereas layout_tv as we have seen answers question of what element inside a tile some thread/value pair corresponds to.
+Whereas layout_tv, as we have seen, answers the question of what element inside a tile some thread/value pair corresponds to.
 
 Going forward we'll also see that there are a couple distinct "styles" of writing CuTe kernels. One, which we'll go over first,
 which is a more manual and explicit style, and the other which presents a higher level abstraction over the first style.
@@ -443,7 +459,7 @@ Ok, the goal of this section is the build a ReduceSum kernel that works on eithe
 So, let's think how we'd do this.
 First, we need a layout that describes which elements of a tile each thread will access.
 Second, we need to decompose the input tensor into subtiles so that each thread block operates on some chunk of data.
-Then, in our kernel, each block will select its corresponding tile
+Then, in our kernel, each block will select its corresponding tile.
 Finally, each thread will load its asigned elements from that tile according the thread layout.
 
 The following code can be found in reduce_2d.py.
@@ -516,17 +532,17 @@ class ReduceSumCompositional:
 
 ```
 
-I hope that this appears somewhat coherent now and that the comments help elucidate.
+I hope that this appears somewhat coherent now and that the comments help to elucidate.
 Two functions that we haven't spoken about yet, but are very important,
-that are being used here are 
+that are doing a lot of heavy lifting here are
 `cute.make_ordered_layout` and `cute.composition`.
 
 `cute.make_ordered_layout` is very similar conceptually to `cute.make_layout`
-but it lets us specify the traversal order of the dimensions
+but it lets us specify the traversal order of the dimensions.
 This determines which dimension is contiguous (fastest varying) and which is slower.
 For instance, when summing over a single row,
 we want our thread block structured as [num_warps, warp_size] where each thread in a warp is adjacent 
-on the same row. Whereas when summing over a column, we want our threads adjacent along the same column.
+on the same row. Whereas when summing over a column, we may want our threads adjacent along the same column.
 
 `cute.composition` is another "glue" piece that bridges the data and thread worlds.
 It specifically will compose a new view such that `R(c) = lhs(rhs(c))`.
@@ -536,7 +552,7 @@ are mapped through the subtile layout to produce actual memory addresses for eac
 So, part of what this style gets you is an explicit, step-by-step kernel,
 where it is very transparent how threads map to memory.
 But for most "normal" kernels, where the thread access pattern
-is regular and rectangular, it does _feel_ verbose.
+is regular and rectangular, it does _feel_ a little verbose.
 The process of manually constructing coordinates into our tiled tensor and
 loading each thread’s values seems to leave us with a lot of room to make
 subtle mistakes. 
@@ -556,15 +572,15 @@ thr_data.load()
 acc += thr_data[0]
 ```
 
-Thinking back to our 2D reduce sum, we know that each warp group is effectively
+Thinking back to our 2d reduce sum, we know that each warp group is effectively
 tiling across either all the rows or all the columns.
 The only thing that changes in the for loop is the subtile index.
 So we end up writing an explicit loop, manually slicing the tensor, composing layouts,
 and loading one element at a time.
 
 Ideally, there would be a simpler approach. A way to describe the entire span of data
-that a thread block should operate on, and then let CuTe automatically figure out
-how to partition that span across threads.
+that a warp or thread block should operate on, and then let CuTe automatically figure out
+how to partition that span across our threads.
 
 What we really want to be able to say is "here is a big chunk of memory, give each thread exactly
 what it is responsible for".
@@ -646,11 +662,11 @@ From looking at this kernel, it does the exact same computation, but it's a lot 
 There's less manual slicing and boilerplate, but it is more opaque and its computation is implicit.
 
 At first glance, it is not clear that iteration occurs across our "super" tile.
-All tiled_copy describes is how threads access data within a single logical tile
+All `tiled_copy` describes is how threads access data within a single logical tile.
 
-The magic of `partition_S` is it can answer the question of "given this n-tile region,
-which pieces of it belong to this thread according to our thread/value layout pattern". It is almost
-doing a structured bin-packing.
+The magic is in `partition_S`. This function can answer the question of "given this n-tile region,
+which pieces of it belong to this thread according to our thread/value layout pattern".
+It is almost doing a structured bin-packing.
 
 In our case, `partition_S` is basically saying (in the last dimension case for example), "lay that
 (num_warps, warp_size) pattern repeatedly across the full length N, and give each thread all
@@ -665,11 +681,11 @@ then `partition_S` applies this slicing across the entire data chunk.
 
 One downside of this that I can imagine you thinking is the issue of out of bounds accesses.
 It isn't obvious how, and looking through the docs we don't see,
-an optional mask we might want to give to `partition_S`.
+an optional mask parameter, like we have in Triton, that we might want to give to `partition_S`.
 So, if your shapes are irregular or not an exact multiple of the tile size,
 you would need to add explicit "tail" logic (perhaps in the form of a compositional kernel) to handle that.
 
-This is all great, but we've only handled the 2d case. What about nD?
+This is all great, but we've only handled the 2d case. What about N-dimensional?
 
 
 ### N-dimensional Reduce Sum
@@ -688,14 +704,14 @@ So, for CuTe, we would first make our layout based on those before and after col
 Something like:
 ```python
 in_layout = cute.make_layout(
-    (self.before_prod, self.reduce_size, self.after_prod),
-    stride=(self.before_stride, self.reduce_stride, self.after_stride)
+    (collapsed_shape_before, reduce_size, collapsed_shape_after),
+    stride=(before_stride, reduce_stride, after_stride)
 ) 
 gInputView = cute.make_tensor(gInput.iterator, in_layout)
 ```
-and we'd to the same for the output tensor as well.
+and we'd apply a similar operation on the output as well.
 
-So, once we reshape the input tensor conceptually into the 3d view (before_prod, reduce_size, after_prod),
+So, once we reshape the input tensor conceptually into the 3d view (collapsed_shape_before, reduce_size, collapsed_shape_after),
 the problem looks very similar to our 2d example.
 The only difference is now we're tiling over the middle dimension (i.e. our reduction dimension)
 instead of over rows or columns.
