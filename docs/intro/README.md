@@ -396,11 +396,13 @@ Let's work through this one. The thread layout is effectively 2d where the last 
 and the stride's last dimension is 1. So, there will be 8 columns with stride 1.
 This checks out with the picture. 
 
-Working in, our shape is (2, 4) and strided (32, 8). Which you can think of as 2 "row groups",
+Working inwards, our shape is (2, 4) and strided (32, 8). Which you can think of as 2 "row groups",
 where each row group contains 4 _rows_.
 Moving within a row group from one row to the next advances the thread id by 8, so each successive row starts 8 threads later.
 Switching from the first to second row group advances the thread id by 32.
 In the visualization, those two groups are interleaved.
+
+### Layout recap
 
 Ok, so layouts provide precise control over how threads are mapped to data accesses. They are clearly
 highly expressive. And though they can be a bit hard to reason over, they are integral to CuTe, so it 
@@ -408,7 +410,9 @@ pays off to focus on them for a bit.
 
 But it still doesn't feel clear how all of this fits together. We have this one world of thread-mapping views, using 
 thr_layout or layout_tv, which describes how threads are organized and which element inside a tile each thread will access.
-Those were our visualizations. But we also have this other world, using functions like zipped_divide, that actually 
+Those were our visualizations.
+
+But we also have this other world, using functions like zipped_divide, that actually 
 take some tensor and decompose it into tiles and subtiles.
 
 What glues these two worlds together are functions like 
@@ -422,5 +426,106 @@ which is a more manual and explicit style, and the other which presents a higher
 
 ### Composition based kernels
 
+Ok, the goal of this section is the build a ReduceSum kernel that works on either dimension of a 2d tensor.
+So, let's think how we'd do this.
+First, we need a layout that describes which elements of a tile each thread will access.
+Second, we need to decompose the input tensor into subtiles so that each thread block operates on some chunk of data.
+Then, in our kernel, each block will select its corresponding tile
+Finally, each thread will load its asigned elements from that tile according the thread layout.
+
+The following code can be found in reduce_2d.py.
+Note that we're not doing bounds checking or any optimizations.
+The goal here is only to illustrate the overall structure of the kernel.
+
+```python
+class ReduceSumCompositional:
+    def __init__(self, shape, dtype, dim=-1):
+        self.shape = shape
+        self.dtype = dtype
+        self.num_warps = 4
+        self.warp_size = 32
+        self.threads_per_block = self.num_warps * self.warp_size
+        self.NEG_INF = Float32(float('-inf'))
+        self.dim = dim
+        self.reduce_size = self.shape[self.dim]
+        self.blocks = self.shape[0] if dim != 0 else self.shape[-1]
+
+        self.order_shape = (self.num_warps, self.warp_size) if self.dim == -1 else (self.warp_size, self.num_warps)
+        self.order = (1, 0) if self.dim == -1 else (0, 1)
+
+    @cute.jit
+    def __call__(self, gInput: cute.Tensor, gOutput: cute.Tensor, stream: cuda.CUstream = None):
+        val_layout = cute.make_layout((1, 1))  # each thread loads a single value
+        # threads either row or column major order depending on dimension were reducing over
+        thr_layout = cute.make_ordered_layout(self.order_shape, self.order)
+        tiled_mn, layout_tv = cute.make_layout_tv(thr_layout, val_layout)
+
+        # decompose our tensor into tiles defined by tiled_mn
+        # gX now has the shape: ((TileM, TileN), (RestM, RestN))
+        #                       ((num_warps, warp_size), (M // num_warps, N // warp_size))
+        gX = cute.zipped_divide(gInput, tiled_mn)
+
+        blocks = cute.ceil_div(self.blocks, self.num_warps)
+        self.kernel(
+            gX, gOutput, layout_tv
+        ).launch(
+            grid=(blocks, 1, 1),
+            block=(self.threads_per_block, 1, 1),
+            stream=stream
+        )
+    
+    @cute.kernel
+    def kernel(self, gX: cute.Tensor, gOutput: cute.Tensor, layout_tv: cute.Layout):
+        tidx, _, _ = cute.arch.thread_idx()  # tidx, tidy, tidz
+        bidx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // self.warp_size
+        lane_idx = tidx % self.warp_size
+
+        acc = Float32(0.0)
+        ntiles = cute.ceil_div(self.reduce_size, self.warp_size)
+        for tile_idx in range(ntiles):
+            # rows of blocks when summing across, else columns of blocks
+            blk_coord = (bidx, tile_idx) if self.dim == -1 else (tile_idx, bidx)
+            # gX's shape is: ((TileM, TileN), (RestM, RestN))
+            # we want to load a complete subtile (i.e. all TileM x TileN values)
+            # the block coordinate is a function of the dimension and if the subtiles go across or down
+            subtile = gX[((None, None), blk_coord)]
+            # map thread layout to data
+            thr_block_frag = cute.composition(subtile, layout_tv)
+            # grab this threads fragment and load
+            thr_data = thr_block_frag[(tidx, None)]
+            thr_data.load()
+            acc += thr_data[0]
+
+        acc = cute.arch.warp_reduction_sum(acc)
+        if lane_idx == 0:
+            gOutput[bidx * self.num_warps + warp_idx] = acc
+
+# If you were to run the benchmark script, you might see something like:
+# dim 0
+# reduce sum cute dim=0: 0.763 ms
+# torch reduce sum dim=0: 0.124 ms
+
+# dim -1
+# reduce sum cute dim=-1: 0.115 ms
+# torch reduce sum dim=-1: 0.127 ms
+```
+
+I hope that this appears somewhat coherent now and that comments help elucidate.
+Two functions that we haven't spoken about yet that are being used here are 
+`cute.make_ordered_layout` and `cute.composition`.
+
+`cute.make_ordered_layout` is very similar conceptually to `cute.make_layout`
+but it lets us specify the traversal order of the dimensions
+This determines which dimension is contiguous (fastest varying) and which is slower.
+For instance, when summing over a single row,
+we want our thread block structured as [num_warps, warp_size] where each thread in a warp is adjacent 
+on the same row. Whereas when summing over a column, we want our threads adjacent along the same column.
+
+`cute.composition` is another "glue" piece that bridges the data and thread worlds.
+It specifically will compose a new view such that `R(c) = lhs(rhs(c))`.
+In our case, this means that the logical (thread, value) coordinates from the layout_tv
+are mapped through the subtile layout to produce actual memory addresses for each thread.
 
 
+### TiledCopy based kernels

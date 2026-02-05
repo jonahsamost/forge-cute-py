@@ -9,7 +9,7 @@ from cutlass import const_expr
 from cute_viz import render_layout_svg, display_layout
 
 
-class ReduceSumA:
+class ReduceSumTiledCopy:
     def __init__(self, shape, dtype, dim=-1):
         self.shape = shape
         self.dtype = dtype
@@ -66,7 +66,7 @@ class ReduceSumA:
             gOutput[bidx * self.num_warps + warp_idx] = rowSum
 
 
-class ReduceSumB:
+class ReduceSumCompositional:
     def __init__(self, shape, dtype, dim=-1):
         self.shape = shape
         self.dtype = dtype
@@ -81,26 +81,21 @@ class ReduceSumB:
         self.order_shape = (self.num_warps, self.warp_size) if self.dim == -1 else (self.warp_size, self.num_warps)
         self.order = (1, 0) if self.dim == -1 else (0, 1)
 
-
     @cute.jit
     def __call__(self, gInput: cute.Tensor, gOutput: cute.Tensor, stream: cuda.CUstream = None):
-        blocks_over_reduce_dim = cute.ceil_div(self.reduce_size, self.warp_size)
-        tiler_mn = (
-            (self.num_warps, blocks_over_reduce_dim * self.warp_size)
-            if self.dim == -1 else
-            (blocks_over_reduce_dim * self.warp_size, self.num_warps)
-        )
-
-        copy_op = cute.nvgpu.CopyUniversalOp()
-        copy_atom = cute.make_copy_atom(copy_op, self.dtype, num_bits_per_copy=self.dtype.width)
-        val_layout = cute.make_layout((1, 1))
-
+        val_layout = cute.make_layout((1, 1))  # each thread loads a single value
+        # threads either row or column major order depending on dimension were reducing over
         thr_layout = cute.make_ordered_layout(self.order_shape, self.order)
-        tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+        tiled_mn, layout_tv = cute.make_layout_tv(thr_layout, val_layout)
+
+        # decompose our tensor into tiles defined by tiled_mn
+        # gX now has the shape: ((TileM, TileN), (RestM, RestN))
+        #                       ((num_warps, warp_size), (M // num_warps, N // warp_size))
+        gX = cute.zipped_divide(gInput, tiled_mn)
 
         blocks = cute.ceil_div(self.blocks, self.num_warps)
         self.kernel(
-            gInput, gOutput, tiler_mn, tiled_copy
+            gX, gOutput, layout_tv
         ).launch(
             grid=(blocks, 1, 1),
             block=(self.threads_per_block, 1, 1),
@@ -108,30 +103,38 @@ class ReduceSumB:
         )
     
     @cute.kernel
-    def kernel(self, gInput: cute.Tensor, gOutput: cute.Tensor, tiler_mn: cute.Shape, tiled_copy: cute.TiledCopy):
-        tidx, _, _ = cute.arch.thread_idx()
+    def kernel(self, gX: cute.Tensor, gOutput: cute.Tensor, layout_tv: cute.Layout):
+        tidx, _, _ = cute.arch.thread_idx()  # tidx, tidy, tidz
         bidx, _, _ = cute.arch.block_idx()
         warp_idx = tidx // self.warp_size
         lane_idx = tidx % self.warp_size
 
-        gX = cute.local_tile(gInput, tiler_mn, (bidx, 0) if self.dim == -1 else (0, bidx))
-        tidxSlice = tiled_copy.get_slice(tidx)  
-        tidxIndices = tidxSlice.partition_S(gX)
-        tidxRegs = cute.make_rmem_tensor_like(tidxIndices)
-        cute.autovec_copy(tidxIndices, tidxRegs)
-        tidxValues = tidxRegs.load()
-        tidLocalSum = tidxValues.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
-        rowSum = cute.arch.warp_reduction_sum(tidLocalSum)
+        acc = Float32(0.0)
+        ntiles = cute.ceil_div(self.reduce_size, self.warp_size)
+        for tile_idx in range(ntiles):
+            # rows of blocks when summing across, else columns of blocks
+            blk_coord = (bidx, tile_idx) if self.dim == -1 else (tile_idx, bidx)
+            # gX's shape is: ((TileM, TileN), (RestM, RestN))
+            # we want to load a complete subtile (i.e. all TileM x TileN values)
+            # the block coordinate is a function of the dimension and if the subtiles go across or down
+            subtile = gX[((None, None), blk_coord)]
+            # map thread layout to data
+            thr_block_frag = cute.composition(subtile, layout_tv)
+            # grab this threads fragment and load
+            thr_data = thr_block_frag[(tidx, None)]
+            thr_data.load()
+            acc += thr_data[0]
+
+        acc = cute.arch.warp_reduction_sum(acc)
         if lane_idx == 0:
-            gOutput[bidx * self.num_warps + warp_idx] = rowSum
+            gOutput[bidx * self.num_warps + warp_idx] = acc
 
 
-
-def benchmark(dim=0):
+def benchmark(dim=0, is_compositional=True):
     print(f"Testing dim: {dim}")
     import time
 
-    M, N = 4096, 768
+    M, N = 4096, 4096
     dtype = torch.float32
     dtype_map = {
         torch.float16: Float16,
@@ -161,7 +164,8 @@ def benchmark(dim=0):
         tuple(output_shape),
         stride_order=tuple(range(len(x.shape) - 1))[::-1]
     ) 
-    softmax = ReduceSumB(x.shape, dtype_map[dtype], dim=dim)
+    cls = ReduceSumCompositional if is_compositional else ReduceSumTiledCopy
+    softmax = cls(x.shape, dtype_map[dtype], dim=dim)
     fn = cute.compile(
         softmax, input_cute, output_cute,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -183,20 +187,30 @@ def benchmark(dim=0):
     for _ in range(10):
         fn(x, output)
     torch.cuda.synchronize()
-    
-    # Benchmark our softmax
-    start = time.perf_counter()
+
+    # Benchmark CuTe kernel
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
     for _ in range(100):
         fn(x, output)
-    torch.cuda.synchronize()
-    print(f"  reduce sum cute dim=-1: {(time.perf_counter() - start) * 10:.3f} ms")
-    
-    # Compare to PyTorch
-    start = time.perf_counter()
-    for _ in range(100):
-        _ = torch.nn.functional.softmax(x, dim=-1)
-    torch.cuda.synchronize()
-    print(f"  torch reduce sum dim=-1:  {(time.perf_counter() - start) * 10:.3f} ms")
+    end.record()
 
-benchmark(dim=0)
-benchmark(dim=-1)
+    torch.cuda.synchronize()
+    cute_ms = start.elapsed_time(end) / 100
+    print(f"reduce sum cute dim={dim}: {cute_ms:.3f} ms")
+
+    # Compare to PyTorch
+    start.record()
+    for _ in range(100):
+        _ = x.sum(dim=dim)
+    end.record()
+
+    torch.cuda.synchronize()
+    torch_ms = start.elapsed_time(end) / 100
+    print(f"torch reduce sum dim={dim}: {torch_ms:.3f} ms")
+
+
+benchmark(dim=0, is_compositional=False)
+benchmark(dim=-1, is_compositional=False)
