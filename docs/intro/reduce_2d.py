@@ -9,7 +9,7 @@ from cutlass import const_expr
 from cute_viz import render_layout_svg, display_layout
 
 
-class ReduceSum:
+class ReduceSumA:
     def __init__(self, shape, dtype, dim=-1):
         self.shape = shape
         self.dtype = dtype
@@ -37,7 +37,6 @@ class ReduceSum:
         order = (1, 0) if self.dim == -1 else (0, 1)
         thr_layout = cute.make_ordered_layout(shape, order)
         tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
-        # render_layout_svg(thr_layout, 'output.svg')
 
         blocks = cute.ceil_div(self.blocks, self.num_warps)
         self.kernel(
@@ -65,6 +64,67 @@ class ReduceSum:
         rowSum = cute.arch.warp_reduction_sum(tidLocalSum)
         if lane_idx == 0:
             gOutput[bidx * self.num_warps + warp_idx] = rowSum
+
+
+class ReduceSumB:
+    def __init__(self, shape, dtype, dim=-1):
+        self.shape = shape
+        self.dtype = dtype
+        self.num_warps = 4
+        self.warp_size = 32
+        self.threads_per_block = self.num_warps * self.warp_size
+        self.NEG_INF = Float32(float('-inf'))
+        self.dim = dim
+        self.reduce_size = self.shape[self.dim]
+        self.blocks = self.shape[0] if dim != 0 else self.shape[-1]
+
+        self.order_shape = (self.num_warps, self.warp_size) if self.dim == -1 else (self.warp_size, self.num_warps)
+        self.order = (1, 0) if self.dim == -1 else (0, 1)
+
+
+    @cute.jit
+    def __call__(self, gInput: cute.Tensor, gOutput: cute.Tensor, stream: cuda.CUstream = None):
+        blocks_over_reduce_dim = cute.ceil_div(self.reduce_size, self.warp_size)
+        tiler_mn = (
+            (self.num_warps, blocks_over_reduce_dim * self.warp_size)
+            if self.dim == -1 else
+            (blocks_over_reduce_dim * self.warp_size, self.num_warps)
+        )
+
+        copy_op = cute.nvgpu.CopyUniversalOp()
+        copy_atom = cute.make_copy_atom(copy_op, self.dtype, num_bits_per_copy=self.dtype.width)
+        val_layout = cute.make_layout((1, 1))
+
+        thr_layout = cute.make_ordered_layout(self.order_shape, self.order)
+        tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+        blocks = cute.ceil_div(self.blocks, self.num_warps)
+        self.kernel(
+            gInput, gOutput, tiler_mn, tiled_copy
+        ).launch(
+            grid=(blocks, 1, 1),
+            block=(self.threads_per_block, 1, 1),
+            stream=stream
+        )
+    
+    @cute.kernel
+    def kernel(self, gInput: cute.Tensor, gOutput: cute.Tensor, tiler_mn: cute.Shape, tiled_copy: cute.TiledCopy):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // self.warp_size
+        lane_idx = tidx % self.warp_size
+
+        gX = cute.local_tile(gInput, tiler_mn, (bidx, 0) if self.dim == -1 else (0, bidx))
+        tidxSlice = tiled_copy.get_slice(tidx)  
+        tidxIndices = tidxSlice.partition_S(gX)
+        tidxRegs = cute.make_rmem_tensor_like(tidxIndices)
+        cute.autovec_copy(tidxIndices, tidxRegs)
+        tidxValues = tidxRegs.load()
+        tidLocalSum = tidxValues.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
+        rowSum = cute.arch.warp_reduction_sum(tidLocalSum)
+        if lane_idx == 0:
+            gOutput[bidx * self.num_warps + warp_idx] = rowSum
+
 
 
 def benchmark(dim=0):
@@ -101,7 +161,7 @@ def benchmark(dim=0):
         tuple(output_shape),
         stride_order=tuple(range(len(x.shape) - 1))[::-1]
     ) 
-    softmax = ReduceSum(x.shape, dtype_map[dtype], dim=dim)
+    softmax = ReduceSumB(x.shape, dtype_map[dtype], dim=dim)
     fn = cute.compile(
         softmax, input_cute, output_cute,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),

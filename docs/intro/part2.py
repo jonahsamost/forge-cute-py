@@ -128,19 +128,22 @@ def compare_torch_initial():
 
 
 @cute.jit
-def print_layout(mA):
-    threads_per_block = 32
-    thr_layout = cute.make_layout((threads_per_block,), stride=(1,))
-    val_layout = cute.make_layout((1,), stride=(1,))
+def print_layout_trash(x):
+    M, N = 32, 64
+    thr_layout = cute.make_layout(((M//4, N//32), (4, 32)) , stride=((4*N, 32), (N, 1)))
+    val_layout = cute.make_layout((1,),  stride=(1,))
     tiler_mn, layout_tv = cute.make_layout_tv(thr_layout, val_layout)
-    gA = cute.zipped_divide(mA, tiler_mn)  # ((TileM, TileN), (RestM, RestN))
+    render_tv_layout_svg(layout_tv, tiler_mn, "tv_layout.svg")
+    gX = cute.zipped_divide(x, tiler_mn)  # ((TileM, TileN), (RestM, RestN))
+    print(f"gX: {gX}")
 
-    print(f"layout: {layout_tv}")
-    print(f"tiler: {tiler_mn}")
-    print(f"gA: {gA}")
-    tiler_2d = (1, tiler_mn[0])
-    gX = cute.zipped_divide(mA, tiler_2d)
-    print(f"gx: {gX}")
-    size = cute.size(gX, mode=[1])
-    print(f"size: {size}")
-    # render_tv_layout_svg(layout_tv, tiler_2d, "tv_layout.svg")
+
+def compile_print():
+    x = torch.randn(256, 512)
+    gx = from_dlpack(x)
+    fn = cute.compile(
+        print_layout_trash,
+        gx
+    )
+    fn(gx)
+compile_print()

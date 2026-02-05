@@ -280,24 +280,29 @@ fn = cute.compile(
 
 All we need to do is add the `options="--enable-tvm-ffi"` and we can also pass the current PyTorch stream as well.
 
-
+Ok, we know how to compile our code, let's actually starting writing on top of CuTe.
 
 
 ### Layouts
 
-Though our code looks more like Cuda written in python, rather than CuTe.
+Looking back at the initial kernel we wrote, it looks more like Cuda than it does like CuTe.
 But we haven't actually used any core abstractions that CuTe supports, namely [Layouts](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/01_layout.html#).
 A Layout, as described in those docs, "present a common interface to multidimensional array access that abstracts away the details of how the array’s elements are organized in memory".
 
 Ok, so let's make use of a simple [layout](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py#L2808).
-As you can see from those docs, a layout is defined mainly by a shape and an optional stride. A layout is not data itself, it is the shape
-and indexing rule that allows you to know where the data is stored and how to traverse it. What is also interesting about layouts is that
+As you can see from those docs, a layout is defined mainly by a shape and an optional stride.
+
+Importantly, a layout is not itself data, it is the shape
+and indexing rule that allows one to know where the data is stored and how to traverse it.
+What is also interesting about layouts is that
 they are both [hierarchical](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/01_layout.html#hierarchical-access-functions) and compositional, which is to say, you can define a layout of layouts.
 
-Ok, so given this, in order to layout-ify our reduce_sum kernel, we know we'd want _some_ sort of hierarchy. If we map our current kernel
-to this layout frame of mind, we know we want each thread to access a single value for each iteration in the main loop.
-So, we can think of this as a layout of shape (1,). We know these N warps will be their own layout, so we can think of them as a layout
-of shape (32 * N,). Finally, we know that in a matrix of shape (M, N) that we will want a layout of (M, warp_layout).
+Ok, so given this, in order to layout-ify our reduce_sum kernel, we know we'd want _some_ sort of hierarchy.
+If we map our current kernel to this layout frame of mind,
+we know we want each thread to access a single value for each iteration in the main loop.
+So, we can think of this as a layout of shape (1,). We know these N warps will be their own layout,
+so we can think of them as a layout of shape (32 * N,).
+Finally, we know that in a matrix of shape (M, N), we will want a layout of (M, warp_layout).
 
 So, conceptually, something similar to:
 ```bash
@@ -310,116 +315,112 @@ Layout<
 >
 ```
 
-But how do we do this? [This](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py#L2808) layout function
-looks like we can use it for ours warps and single thread value. 
-Looking into the cutlass [notebook](https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/notebooks/elementwise_add.ipynb)
-we see that in order to combine them we must make use of `cute.make_layout_tv` from [here](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py#L3956).
-So, we will need to do something like this:
+But this is getting too heavy and too hard to follow, so let's ground ourselves.
+Let's break from writing code for a second to make visualizations.
+
+We know that a layout is simply a mapping from thread indices to memory offsets
+that each thread will load/store from. But how CuTe wants us to use them seems overly
+confused.
+
+I think its a great intuition pump to actually _see_ some layout visualizations.
+And see how the printed layout_tv maps to the visualizations you see. Let's start with an easy one:
+
 ```python
 @cute.jit
-def print_layout():
-    threads_per_block = 32
-    thr_layout = cute.make_layout((threads_per_block,), stride=(1,))
+def print_layout_trash(x):
+    thr_layout = cute.make_layout((32,), stride=(1,))
     val_layout = cute.make_layout((1,), stride=(1,))
     tiler_mn, layout_tv = cute.make_layout_tv(thr_layout, val_layout)
-    print(f"layout: {layout_tv}")
-    print(f"tiler: {tiler_mn}")
-    tiler_2d = (1, tiler_mn[0]) # cute-viz expects 2d
-    render_tv_layout_svg(layout_tv, tiler_2d, "tv_layout.svg")
+    tiler_mn = (1, tiler_mn[0])
+    render_tv_layout_svg(layout_tv, tiler_mn, "tv_layout.svg")
+    gX = cute.zipped_divide(x, tiler_mn)  # ((TileM, TileN), (RestM, RestN))
+    print(f"gX: {gX}")
 
-print_layout()
+
+def compile_print():
+    x = torch.randn(64, 32)
+    gx = from_dlpack(x)
+    fn = cute.compile(
+        print_layout_trash,
+        gx
+    )
+    fn(gx)
+> compile_print()
 ...
-layout: (32,1):(1,0)
-tiler: (32,)
+gX: tensor<ptr<f32, generic> o ((1,32),(64,1)):((0,1),(32,0))>
 ```
-
-Visualizing that with cute-viz's `render_tv_layout_svg` shows that each thread in the warp will work on a
-single value at a time. And we can just iterate over all the columns of whatever row we are to retrieve all the values.
 ![TV Layout Visualization](tv_layout_32_1.svg)
 
-Looking back to the cutlass notebook, we see that `cute.zipped_divide` is the means through which we will then tile our
-layout over our whole MxN tensor. Extending our print_layout() function to call `cute.zipped_divide` 
+The layout visualizaton makes sense, but we need to remind ourselves what `zipped_divide` gives us.
+Note that for the purpose of this post, I'm statically compiling such that it's easier to understand how things
+fit together, but if/when you compile dynamically, because the compiler doesn't know the shape
+of those dynamic parameters, you may see something like `(1,32),(?,?)`.
+
+But `(1,32),(64,1)` make sense. `zipped_divide` will return a shape of (tile_size, number_of_tiles), or 
+how you might usually see it defined, ((TileM, TileN), (RestM, RestN)). And this generalizes to n-dimensional
+shapes as well, i.e. ((inner), (outer)), where the left hand size is fine-grained
+(the position inside one tile) and the right is coarse-grained (i.e. which tile you are in).
+
+So, with this in mind, we know we have a single tile of shape (1, 32) and 64 tiles. That's exactly our tensor!
+
+Alright, next one. What about:
+
 ```python
-    ...
-    gX = cute.zipped_divide(mA, tiler_2d)
-    print(f"gx: {gX}")
+> thr_layout = cute.make_layout((4, 8), stride=(8,1))
+> val_layout = cute.make_layout((1,), stride=(1,))
+...
+gX: tensor<ptr<f32, generic> o ((4,8),(16,4)):((32,1),(128,8))>
 ```
-We see: `gx: tensor<ptr<f32, gmem> o ((1,32),(?,?)):((0,1),(?,32))>`, which is CuTe telling us that some values are
-dynamic and not statically known at compile time. But how should we read this? CuTe will print tensors as:
-`tensor<ptr<T, space> o SHAPE : STRIDE >`. Looking back to the [cutlass](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/02_layout_algebra.html#zipped-tiled-flat-divides) docs sheds some light.
+![TV Layout Visualization](tv_layout_4_8.svg)
 
-```bash
-# We see from the docs that the shape returned from zipped_divide is ((TileM,TileN), (RestM,RestN,L,...))
-# This shape corresponds to how we called zipped_divide
-shape = (1,32),(?,?)  
-# Since we called
-zipped_divide(mA, tiler=(1,32))
-# Because tiler is (1,32)
-# we know that TileM=1, TileN=32
-# and RestM = M / 1 = M and RestN = N / 32 = ceil(N, 32)
-```
+Ok, so each tile is of shape (4, 8), and because our tensor is (64, 32),
+we get 64 / 4 == 16 and 32 / 4 == 8. Ok, so the shapes make sense, how about the strides? 
 
-And putting it altogether, we get something like this:
+
+So, again, we think inside to out. For (32, 1), in order to move 1 _row_ _within_ a tile, you will
+skip 32, and to move to the next _column_ also _within_ a tile, you would skip 1. Then in terms of our grid,
+it becomes intuitive, in order to skip to the next _tile row_, you would skip 4 * 32 = 128 
+(i.e. one tiles worth of rows) and to move to the next _tile col_, you simply skip 8, or one tile's width.
+
+Ok, next one:
 ```python
-@cute.kernel
-def _reduce_sum(input: cute.Tensor, output: cute.Tensor, tv_layout, num_warps: int):
-    smem_alloc = cutlass.utils.SmemAllocator()
-    shmem = smem_alloc.allocate_tensor(cute.Float32, cute.make_layout((32,)))
-
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-    lane = cute.arch.lane_idx()
-    warp = cute.arch.warp_idx()
-
-    acc = cute.Float32(0.0)
-
-    _, mode1 = input.shape
-    ntiles = mode1[1]
-
-    for tile_idx in range(ntiles):
-        blk_coord = ((0, None), (bidx, tile_idx)) # all values in this [bidx, tile_idx] tile 
-        blk = input[blk_coord]
-        thr_frag = cute.composition(blk, tv_layout)
-        thr_val  = thr_frag[tidx, 0]
-        acc += thr_val
-
-    acc = cute.arch.warp_reduction_sum(acc)
-    if lane == 0:
-        shmem[warp] = acc
-    cute.arch.sync_threads()
-
-    if warp == 0:
-        acc2 = shmem[lane] if lane < num_warps else 0.0
-        acc2 = cute.arch.warp_reduction_sum(acc2)
-        if lane == 0:
-            output[bidx] = acc2
-
-@cute.jit
-def reduce_sum(x, output):
-    num_warps = 16
-    threads_per_block = 512
-    M, N = x.shape
-
-    thr_layout = cute.make_layout((threads_per_block,), stride=(1,))
-    val_layout = cute.make_layout((1,), stride=(1,))
-    tiled_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
-    gX = cute.zipped_divide(x, (1, tiled_mn[0]))
-    
-    _reduce_sum(gX, output, tv_layout, num_warps).launch(
-        grid=(M, 1, 1),
-        block=(threads_per_block, 1, 1),
-    )
+> thr_layout = cute.make_layout(((2, 4), 8), stride=((32, 8), 1))
+> val_layout = cute.make_layout((1,), stride=(1,))
+...
+gX: tensor<ptr<f32, generic> o ((8,8),(8,4)):((32,1),(256,8))>
 ```
 
+![TV Layout Visualization](tv_layout_2_4_8.svg)
+
+Let's work through this one. The thread layout is effectively 2d where the last dimension is 8
+and the stride's last dimension is 1. So, there will be 8 columns with stride 1.
+This checks out with the picture. 
+
+Working in, our shape is (2, 4) and strided (32, 8). Which you can think of as 2 "row groups",
+where each row group contains 4 _rows_.
+Moving within a row group from one row to the next advances the thread id by 8, so each successive row starts 8 threads later.
+Switching from the first to second row group advances the thread id by 32.
+In the visualization, those two groups are interleaved.
+
+Ok, so layouts provide precise control over how threads are mapped to data accesses. They are clearly
+highly expressive. And though they can be a bit hard to reason over, they are integral to CuTe, so it 
+pays off to focus on them for a bit.
+
+But it still doesn't feel clear how all of this fits together. We have this one world of thread-mapping views, using 
+thr_layout or layout_tv, which describes how threads are organized and which element inside a tile each thread will access.
+Those were our visualizations. But we also have this other world, using functions like zipped_divide, that actually 
+take some tensor and decompose it into tiles and subtiles.
+
+What glues these two worlds together are functions like 
+make_layout_tv. In a function call like `tiler_mn, layout_tv = cute.make_layout_tv(thr_layout, val_layout)`
+tiler_mn answers a purely data question. Namely, how big of a tile does this thread/value configuration cover?
+Whereas layout_tv as we have seen answers question of what element inside a tile some thread/value pair corresponds to.
+
+Going forward we'll also see that there are a couple distinct "styles" of writing CuTe kernels. One, which we'll go over first,
+which is a more manual and explicit style, and the other which presents a higher level abstraction over the first style.
+
+
+### Composition based kernels
 
 
 
-
-But is caching really that simple? Aren't we incuring overhead from that `from_dlpack` call?
-What does that call even do? Looking at the [docs](https://github.com/NVIDIA/cutlass/blob/a4eb0e05f6dd0403f94087b495393bdca75bf0ad/python/CuTeDSL/cutlass/cute/runtime.py#L746), this function is seemingly only creating for us a `cutlass.cute.Tensor`.
-How much overhead could that be? 
-
-Let's run
-```
-nsys profile --trace=cuda,nvtx,osrt --force-overwrite true -o launch_profile uv run python -m compare_torch_initial_cached
-```
