@@ -11,6 +11,7 @@ The second is to motivate why certain patterns exist in CuTe.
 Let's start with a simple question, how do I even run code?
 A lot of this example inspiration comes from Nvidia's cutlass example [here](https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/notebooks/elementwise_add.ipynb).
 
+
 So, let's create just a simple kernel, for now only focusing on the last dimension and assume a contiguous, 2d tensor.
 ```python
 @cute.kernel
@@ -146,18 +147,22 @@ AcceleratorError: CUDA error: an illegal memory access was encountered
 Hrm. Looking back up to our `_invoke_reduce_sum_with_cache` function, we see it will compile our `reduce_sum`
 function with two arguments, which are both passed through a call to `from_dlpack`. Reading the docs for 
 [from_dlpack](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/runtime.py#L746) aren't very 
-elucidating. It's purpose is to "from tensor object supporting __dlpack__() to a CuTe Tensor".
+elucidating. It's purpose is to convert us "from tensor object supporting __dlpack__() to a CuTe Tensor".
 
 Reading some docs we see that using `from_dlpack` results in a CuTe tensor with a [fully static layout](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/framework_integration.html#explicit-conversion-using-from-dlpack).
-Ok, this makes sense why changing the layout resulted in an access memory. How can easily define static vs dynamic layouts?
 
-The Nvidia [docs](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_dynamic_layout.html#static-layout) 
-offers good advice. In speaking to static layouts, they say
-"if we call the compiled function with a different shape of the input torch.Tensor,
+In speaking to [static layouts](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_dynamic_layout.html#static-layout), they say "if we call the compiled function with a different shape of the input torch.Tensor,
 it would result in an unexpected result at runtime due to the mismatch of the type since
 compiled_func expects a cute.Tensor with" a different shape.
 
-Ah, so in order to support _any_ shapes for our kernel, we would just:
+Ok, so now this makes sense why changing the layout resulted in an access memory.
+We told the CuTe compiler that we want a single shape, then gave it something different.
+
+How can we easily define static vs dynamic layouts?
+
+Further down that page offers [advice](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_dynamic_layout.html#dynamic-layout)
+
+In order to support _any_ shapes for our kernel, we would just:
 ```python
 @cute.jit
 def reduce_sum(x: cute.Tensor, output: cute.Tensor):
@@ -211,11 +216,14 @@ We see Success! printed.
 
 ### Meeting in the middle
 
-But backing up a little bit, do we really just want static or dynamic? Assume some sort of best practices
-in choosing the key with which to match our compiled function (i.e. some tuple of the input's and output's shape, dtype, stride).
-For our `reduce_sum` example, for instance, all dimension-0 affects is how many blocks we launch. Making this dynamic 
-makes a lot of sense. But changing the inner dimension, might affect how the compiler chooses to emit it's code. Unrolling,
-vectorization width, tiling, etc. might result in code that has more branches or is just more generic for the average case.
+But backing up a little bit, do we really want to choose strictly between static or dynamic layouts?
+When deciding how to cache compiled kernels, we’ll typically use some combination of shape, dtype, stride, and similar properties as the key.
+
+For our reduce_sum example, the outer dimension really only affects how many blocks we launch.
+Making that dimension dynamic makes a lot of sense, since it doesn’t change the structure of the generated code at all.
+The inner dimension is a different story.
+Changing that dimension can affect how the compiler chooses to generate code: unrolling, vectorization width, tiling strategies, etc.
+We might even want to generate different kernel variants optimized for different inner-dimension sizes, instead of relying on one generic version that works for everything.
 
 This is why CuTe wants you to take the [middle path](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/framework_integration.html#mark-the-tensor-s-layout-as-dynamic-with-mark-layout-dynamic).
 In our example, maybe we want the first dimension to be dynamic but the last dimension to be static.
@@ -249,11 +257,14 @@ Ok, they have me interested with "Faster JIT function invocation", so what is TV
 In the CuTe context, TVM-FFI is an optional calling interface for JIT functions that allows those functions to be called more efficiently.
 If you're interested in going deeper into TVM-FFI, check [this](https://www.youtube.com/watch?v=xMzcs6AqLVo) video out.
 
-Use TVM-FFI when you care about the overhead of calling a CuTe JIT-compiled function, or you want to call the compiled function with torch.Tensor inputs/outputs directly.
+So, basically use TVM-FFI when you care about the overhead of calling a CuTe JIT-compiled function,
+or you want to call the compiled function with torch.Tensor inputs/outputs directly.
 
-For example, if you are benchmarking your kernels and you have an intuition that your kernel _should be_ faster but it's slower than torch's, and so
-you open up nsys and see "bubbles" between your kernels. The next kernel isn’t submitted until noticeably after the previous one completes.
-That gap is typically host-side work (Python/CuTe dispatch, conversions such as from_dlpack, etc). TVM-FFI is used to help reduce that overhead.
+For example, if you are benchmarking your kernels and you have an intuition that your kernel _should be_ faster but it's slower than torch's.
+So, you open up nsys and see "bubbles" between your kernels,
+i.e. the next kernel isn’t submitted until very noticeably after the previous one completes.
+That gap is typically host-side work (Python/CuTe dispatch, conversions such as from_dlpack, etc).
+TVM-FFI is used to help reduce that overhead.
 
 So, let's use it, it couldn't be simpler and it's helpful!
 ```
@@ -282,11 +293,12 @@ All we need to do is add the `options="--enable-tvm-ffi"` and we can also pass t
 
 Ok, we know how to compile our code, let's actually starting writing on top of CuTe.
 
-
 ### Layouts
 
+Not so fast!
+
 Looking back at the initial kernel we wrote, it looks more like Cuda than it does like CuTe.
-But we haven't actually used any core abstractions that CuTe supports, namely [Layouts](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/01_layout.html#).
+We haven't actually used any core abstractions that CuTe supports, namely [Layouts](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/01_layout.html#).
 A Layout, as described in those docs, "present a common interface to multidimensional array access that abstracts away the details of how the array’s elements are organized in memory".
 
 Ok, so let's make use of a simple [layout](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py#L2808).
@@ -315,12 +327,13 @@ Layout<
 >
 ```
 
-But this is getting too heavy and too hard to follow, so let's ground ourselves.
-Let's break from writing code for a second to make visualizations.
+But is this really the right way to be thinking about layouts? 
 
-We know that a layout is simply a mapping from thread indices to memory offsets
-that each thread will load/store from. But how CuTe wants us to use them seems overly
-confused.
+The docs are a bit heavy and too hard to follow, so let's ground ourselves and visualize!
+
+We know that a layout is simply a mapping from thread indices to memory offsets that each thread will load/store from.
+Or more generally, a mapping from logical indices to memory offsets.
+But how CuTe wants us to use them seems overly confused.
 
 I think its a great intuition pump to actually _see_ some layout visualizations.
 And see how the printed layout_tv maps to the visualizations you see. Let's start with an easy one:
