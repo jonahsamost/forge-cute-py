@@ -21,21 +21,29 @@ class ReduceSumTiledCopy:
         self.reduce_size = self.shape[self.dim]
         self.blocks = self.shape[0] if dim != 0 else self.shape[-1]
 
+        self.order_shape = (self.num_warps, self.warp_size) if self.dim == -1 else (self.warp_size, self.num_warps)
+        self.order = (1, 0) if self.dim == -1 else (0, 1)
+
     @cute.jit
     def __call__(self, gInput: cute.Tensor, gOutput: cute.Tensor, stream: cuda.CUstream = None):
         blocks_over_reduce_dim = cute.ceil_div(self.reduce_size, self.warp_size)
+        
+        # construct a "super tile" that spans the entire portion of the reduction
+        # dimension handled by this thread block
         tiler_mn = (
-            (self.num_warps, blocks_over_reduce_dim * self.warp_size) # fully cover dimension
+            (self.num_warps, blocks_over_reduce_dim * self.warp_size)
             if self.dim == -1 else
-            (blocks_over_reduce_dim * self.warp_size, self.num_warps) # fully cover dimension
+            (blocks_over_reduce_dim * self.warp_size, self.num_warps)
         )
 
+        # copy atom answers how should a single thread load its data
+        # need to ensure our copy atom and val layout are compatible
         copy_op = cute.nvgpu.CopyUniversalOp()
         copy_atom = cute.make_copy_atom(copy_op, self.dtype, num_bits_per_copy=self.dtype.width)
         val_layout = cute.make_layout((1, 1))
-        shape = (self.num_warps, self.warp_size) if self.dim == -1 else (self.warp_size, self.num_warps)
-        order = (1, 0) if self.dim == -1 else (0, 1)
-        thr_layout = cute.make_ordered_layout(shape, order)
+        
+        # define how threads are organized within a tile
+        thr_layout = cute.make_ordered_layout(self.order_shape, self.order)
         tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
         blocks = cute.ceil_div(self.blocks, self.num_warps)
@@ -54,9 +62,13 @@ class ReduceSumTiledCopy:
         warp_idx = tidx // self.warp_size
         lane_idx = tidx % self.warp_size
 
+        # gX is now a "super" tile over all subtiles that our thread group will work on
         gX = cute.local_tile(gInput, tiler_mn, (bidx, 0) if self.dim == -1 else (0, bidx))
+        # where will this thread load its data from relative to our thread layout
         tidxSlice = tiled_copy.get_slice(tidx)  
+        # get me all the addresses that our thread is responsible for across our "super" tile
         tidxIndices = tidxSlice.partition_S(gX)
+        # create registers, load our data, reduce, and write
         tidxRegs = cute.make_rmem_tensor_like(tidxIndices)
         cute.autovec_copy(tidxIndices, tidxRegs)
         tidxValues = tidxRegs.load()
@@ -212,5 +224,5 @@ def benchmark(dim=0, is_compositional=True):
     print(f"torch reduce sum dim={dim}: {torch_ms:.3f} ms")
 
 
-benchmark(dim=0, is_compositional=False)
-benchmark(dim=-1, is_compositional=False)
+# benchmark(dim=0, is_compositional=False)
+# benchmark(dim=-1, is_compositional=False)

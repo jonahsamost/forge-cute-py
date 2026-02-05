@@ -514,18 +514,11 @@ class ReduceSumCompositional:
         if lane_idx == 0:
             gOutput[bidx * self.num_warps + warp_idx] = acc
 
-# If you were to run the benchmark script, you might see something like:
-# dim 0
-# reduce sum cute dim=0: 0.763 ms
-# torch reduce sum dim=0: 0.124 ms
-
-# dim -1
-# reduce sum cute dim=-1: 0.115 ms
-# torch reduce sum dim=-1: 0.127 ms
 ```
 
-I hope that this appears somewhat coherent now and that comments help elucidate.
-Two functions that we haven't spoken about yet that are being used here are 
+I hope that this appears somewhat coherent now and that the comments help elucidate.
+Two functions that we haven't spoken about yet, but are very important,
+that are being used here are 
 `cute.make_ordered_layout` and `cute.composition`.
 
 `cute.make_ordered_layout` is very similar conceptually to `cute.make_layout`
@@ -540,5 +533,292 @@ It specifically will compose a new view such that `R(c) = lhs(rhs(c))`.
 In our case, this means that the logical (thread, value) coordinates from the layout_tv
 are mapped through the subtile layout to produce actual memory addresses for each thread.
 
+So, part of what this style gets you is an explicit, step-by-step kernel,
+where it is very transparent how threads map to memory.
+But for most "normal" kernels, where the thread access pattern
+is regular and rectangular, it does _feel_ verbose.
+The process of manually constructing coordinates into our tiled tensor and
+loading each thread’s values seems to leave us with a lot of room to make
+subtle mistakes. 
+
+So, thankfully, there is a higher abstraction over this pattern!
 
 ### TiledCopy based kernels
+
+Ok, so in the compositional kernel, it was really this part that we felt was too verbose
+and mistake causing:
+```python
+blk_coord = (bidx, tile_idx) if self.dim == -1 else (tile_idx, bidx)
+subtile = gX[((None, None), blk_coord)]
+thr_block_frag = cute.composition(subtile, layout_tv)
+thr_data = thr_block_frag[(tidx, None)]
+thr_data.load()
+acc += thr_data[0]
+```
+
+Thinking back to our 2D reduce sum, we know that each warp group is effectively
+tiling across either all the rows or all the columns.
+The only thing that changes in the for loop is the subtile index.
+So we end up writing an explicit loop, manually slicing the tensor, composing layouts,
+and loading one element at a time.
+
+Ideally, there would be a simpler approach. A way to describe the entire span of data
+that a thread block should operate on, and then let CuTe automatically figure out
+how to partition that span across threads.
+
+What we really want to be able to say is "here is a big chunk of memory, give each thread exactly
+what it is responsible for".
+
+And this pattern (i.e. take a tile of data, distribute it according to a thread layout, and
+efficiently load it into registers) is exactly the problem that TiledCopy is meant to solve.
+
+```python
+class ReduceSumTiledCopy:
+    def __init__(self, shape, dtype, dim=-1):
+        self.shape = shape
+        self.dtype = dtype
+        self.num_warps = 4
+        self.warp_size = 32
+        self.threads_per_block = self.num_warps * self.warp_size
+        self.NEG_INF = Float32(float('-inf'))
+        self.dim = dim
+        self.reduce_size = self.shape[self.dim]
+        self.blocks = self.shape[0] if dim != 0 else self.shape[-1]
+
+        self.order_shape = (self.num_warps, self.warp_size) if self.dim == -1 else (self.warp_size, self.num_warps)
+        self.order = (1, 0) if self.dim == -1 else (0, 1)
+
+    @cute.jit
+    def __call__(self, gInput: cute.Tensor, gOutput: cute.Tensor, stream: cuda.CUstream = None):
+        blocks_over_reduce_dim = cute.ceil_div(self.reduce_size, self.warp_size)
+        
+        # construct a "super tile" that spans the entire portion of the reduction
+        # dimension handled by this thread block
+        tiler_mn = (
+            (self.num_warps, blocks_over_reduce_dim * self.warp_size)
+            if self.dim == -1 else
+            (blocks_over_reduce_dim * self.warp_size, self.num_warps)
+        )
+
+        # copy atom answers how should a single thread load its data
+        # need to ensure our copy atom and val layout are compatible
+        copy_op = cute.nvgpu.CopyUniversalOp()
+        copy_atom = cute.make_copy_atom(copy_op, self.dtype, num_bits_per_copy=self.dtype.width)
+        val_layout = cute.make_layout((1, 1))
+        
+        # define how threads are organized within a tile
+        thr_layout = cute.make_ordered_layout(self.order_shape, self.order)
+        tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+        blocks = cute.ceil_div(self.blocks, self.num_warps)
+        self.kernel(
+            gInput, gOutput, tiler_mn, tiled_copy
+        ).launch(
+            grid=(blocks, 1, 1),
+            block=(self.threads_per_block, 1, 1),
+            stream=stream
+        )
+    
+    @cute.kernel
+    def kernel(self, gInput: cute.Tensor, gOutput: cute.Tensor, tiler_mn: cute.Shape, tiled_copy: cute.TiledCopy):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // self.warp_size
+        lane_idx = tidx % self.warp_size
+
+        # gX is now a "super" tile over all subtiles that our thread group will work on
+        gX = cute.local_tile(gInput, tiler_mn, (bidx, 0) if self.dim == -1 else (0, bidx))
+        # where will this thread load its data from relative to our thread layout
+        tidxSlice = tiled_copy.get_slice(tidx)  
+        # get me all the addresses that our thread is responsible for across our "super" tile
+        tidxIndices = tidxSlice.partition_S(gX)
+        # create registers, load our data, reduce, and write
+        tidxRegs = cute.make_rmem_tensor_like(tidxIndices)
+        cute.autovec_copy(tidxIndices, tidxRegs)
+        tidxValues = tidxRegs.load()
+        tidLocalSum = tidxValues.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
+        rowSum = cute.arch.warp_reduction_sum(tidLocalSum)
+        if lane_idx == 0:
+            gOutput[bidx * self.num_warps + warp_idx] = rowSum
+```
+
+From looking at this kernel, it does the exact same computation, but it's a lot more declarative.
+There's less manual slicing and boilerplate, but it is more opaque and its computation is implicit.
+
+At first glance, it is not clear that iteration occurs across our "super" tile.
+All tiled_copy describes is how threads access data within a single logical tile
+
+The magic of `partition_S` is it can answer the question of "given this n-tile region,
+which pieces of it belong to this thread according to our thread/value layout pattern". It is almost
+doing a structured bin-packing.
+
+In our case, `partition_S` is basically saying (in the last dimension case for example), "lay that
+(num_warps, warp_size) pattern repeatedly across the full length N, and give each thread all
+the indices it will wind up owning". And what's very cool is that this idea generalizes in that 
+`partition_S` can work across any arbitrary n-dimensional tensor.
+
+So, now it should be clear how these pieces fit together. `tiler_mn` will define the bounds of
+some chunk of data that we want our thread group to access, `local_tile` gives us a view over
+a _specific_ chunk of data, `get_slice` tells each thread which portion of a
+single logical tile it is responsible for,
+then `partition_S` applies this slicing across the entire data chunk.
+
+One downside of this that I can imagine you thinking is the issue of out of bounds accesses.
+It isn't obvious how, and looking through the docs we don't see,
+an optional mask we might want to give to `partition_S`.
+So, if your shapes are irregular or not an exact multiple of the tile size,
+you would need to add explicit "tail" logic (perhaps in the form of a compositional kernel) to handle that.
+
+This is all great, but we've only handled the 2d case. What about nD?
+
+
+### N-dimensional Reduce Sum
+
+There are probably many ways to solve this problem, but below is my explanation on how I chose to solve it.
+
+Any n-dimensional tensor can be viewed as 3-d tensor if you collapse some of the dimension's shapes.
+This is important for us here because if we have a tensor and are reducing over dimension q of size R,
+then we can view the tensor as having the shape (m, R, n), where we'd change both the before and after shapes
+and strides.
+
+Within CuTe, there exists a function `cute.make_tensor` that does just this. It creates a tensor by composing
+an iterator with a layout.
+
+So, for CuTe, we would first make our layout based on those before and after collapsed strides and shapes.
+Something like:
+```python
+in_layout = cute.make_layout(
+    (self.before_prod, self.reduce_size, self.after_prod),
+    stride=(self.before_stride, self.reduce_stride, self.after_stride)
+) 
+gInputView = cute.make_tensor(gInput.iterator, in_layout)
+```
+and we'd to the same for the output tensor as well.
+
+So, once we reshape the input tensor conceptually into the 3d view (before_prod, reduce_size, after_prod),
+the problem looks very similar to our 2d example.
+The only difference is now we're tiling over the middle dimension (i.e. our reduction dimension)
+instead of over rows or columns.
+
+This means our tiler also needs to be 3d to match this view of the data.
+We want the tiler to span the entire reduction dimension
+while leaving the “before” and “after” dimensions untouched.
+In other words, each _warp_ should operate on a region of shape `(1, reduce_size, 1)`.
+
+By constructing a tiler of shape (1, warps_to_cover_reduce_dim * warp_size, 1),
+we are telling CuTe "give me a chunk of data that covers the _full_ range we want to cover".
+
+In the kernel itself, we isolate each warp, though we launch the kernel with multiple warps,
+and so each warp will have its own, different data view,
+i.e. each warp, not each thread block as before, has its own "super tile".
+
+From there, the logic is identical to the 2d case.
+
+Here you see just how powerful functions like `local_tile` or `partition_S` can be. Given an arbitrary
+shaped and strided tensor, help to give us the exact indices that any given thread needs to work over.
+
+```python
+class ReduceSum:
+    def __init__(self, shape, dtype, dim=-1):
+        self.shape = shape
+        self.dtype = dtype
+        self.bits_read = self.dtype.width
+        self.num_warps = 4
+        self.warp_size = 32
+        self.threads_per_block = self.num_warps * self.warp_size
+        self.NEG_INF = Float32(float('-inf'))
+        self.dim = dim
+
+        rank = len(self.shape)
+        strides = [1]
+        mult = 1
+        for d in self.shape[1:][::-1]:
+            mult *= d
+            strides.insert(0, mult)
+        self.strides = strides
+
+        self.reduce_size = shape[dim]
+
+        self.before_shape = shape[:dim]
+        self.after_shape = shape[dim + 1:]
+
+        self.before_prod = math.prod(self.before_shape) if dim > 0 else 1
+        self.after_prod = math.prod(self.after_shape) if dim < rank - 1 else 1
+
+        self.before_stride = strides[dim - 1] if dim > 0 else 0
+        self.after_stride = strides[-1] if dim < rank - 1 else 0
+        self.reduce_stride = strides[dim]
+        
+        self.output_shape = (*self.before_shape, *self.after_shape)
+        self.blocks = math.prod(self.output_shape)
+
+    @cute.jit
+    def __call__(self, gInput: cute.Tensor, gOutput: cute.Tensor, stream: cuda.CUstream = None):
+
+        reduce_cover_blocks = cute.ceil_div(self.reduce_size, self.warp_size)
+        copy_op = cute.nvgpu.CopyUniversalOp()
+        copy_atom = cute.make_copy_atom(copy_op, self.dtype, num_bits_per_copy=self.bits_read)
+
+        in_layout = cute.make_layout(
+            (self.before_prod, self.reduce_size, self.after_prod),
+            stride=(self.before_stride, self.reduce_stride, self.after_stride)
+        ) 
+        gInputView = cute.make_tensor(gInput.iterator, in_layout)
+        out_layout = cute.make_layout(
+            (self.before_prod, self.after_prod),
+            stride=(self.after_prod, 1)
+        )
+        gOutputView = cute.make_tensor(gOutput.iterator, out_layout)
+
+        thr_layout = cute.make_ordered_layout(
+            (self.num_warps, self.warp_size),
+            order=(1, 0)
+        )
+        val_layout = cute.make_layout((1, 1))
+        tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+        tiler_nd = (
+            1,
+            reduce_cover_blocks * self.warp_size,
+            1
+        )
+        blocks = cute.ceil_div(self.blocks, self.num_warps)
+        self.kernel(
+            gInputView, gOutputView, tiler_nd, tiled_copy
+        ).launch(
+            grid=(blocks, 1, 1),
+            block=(self.threads_per_block, 1, 1),
+            stream=stream
+        )
+    
+    @cute.kernel
+    def kernel(self, gInput: cute.Tensor, gOutput: cute.Tensor, tiler_mn: cute.Shape, tiled_copy: cute.TiledCopy):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        warp_idx = tidx // self.warp_size
+        lane_idx = tidx % self.warp_size
+
+        out_idx = bidx * self.num_warps + warp_idx
+        before_idx = out_idx // self.after_prod
+        after_idx = out_idx % self.after_prod
+
+        gX = cute.local_tile(gInput, tiler_mn, (before_idx, None, after_idx))
+        tidxSlice = tiled_copy.get_slice(tidx)  
+        tidxIndices = tidxSlice.partition_S(gX)
+        tidxRegs = cute.make_rmem_tensor_like(tidxIndices)
+        cute.autovec_copy(tidxIndices, tidxRegs)
+        tidxValues = tidxRegs.load()
+        tidLocalSum = tidxValues.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
+        rowSum = cute.arch.warp_reduction_sum(tidLocalSum)
+        if lane_idx == 0:
+            gOutput[before_idx, after_idx] = rowSum
+```
+
+
+### Final thoughts
+
+This post is the post I wish I had when I first started using CuTe.
+The main takeaway is that is that CuTe is less about writing loops than describing structure.
+Once you express how threads and data relate through layouts,
+the framework itself can do most of the mechanical work for you.
+
+There's a lot more to cover, but those are topics for another day.

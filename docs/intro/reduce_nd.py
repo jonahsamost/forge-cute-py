@@ -37,13 +37,10 @@ class ReduceSum:
         self.before_prod = math.prod(self.before_shape) if dim > 0 else 1
         self.after_prod = math.prod(self.after_shape) if dim < rank - 1 else 1
 
-        # self.before_stride = strides[dim - 1] if dim > 0 else 0
         self.before_stride = strides[dim - 1] if dim > 0 else 0
         self.after_stride = strides[-1] if dim < rank - 1 else 0
         self.reduce_stride = strides[dim]
         
-        # self.reduce_stride = strides[dim]
-
         self.output_shape = (*self.before_shape, *self.after_shape)
         self.blocks = math.prod(self.output_shape)
 
@@ -93,20 +90,19 @@ class ReduceSum:
         lane_idx = tidx % self.warp_size
 
         out_idx = bidx * self.num_warps + warp_idx
-        if out_idx < self.blocks:
-            before_idx = out_idx // self.after_prod
-            after_idx = out_idx % self.after_prod
+        before_idx = out_idx // self.after_prod
+        after_idx = out_idx % self.after_prod
 
-            gX = cute.local_tile(gInput, tiler_mn, (before_idx, 0, after_idx))
-            tidxSlice = tiled_copy.get_slice(tidx)  
-            tidxIndices = tidxSlice.partition_S(gX)
-            tidxRegs = cute.make_rmem_tensor_like(tidxIndices)
-            cute.autovec_copy(tidxIndices, tidxRegs)
-            tidxValues = tidxRegs.load()
-            tidLocalSum = tidxValues.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
-            rowSum = cute.arch.warp_reduction_sum(tidLocalSum)
-            if lane_idx == 0:
-                gOutput[before_idx, after_idx] = rowSum
+        gX = cute.local_tile(gInput, tiler_mn, (before_idx, None, after_idx))
+        tidxSlice = tiled_copy.get_slice(tidx)  
+        tidxIndices = tidxSlice.partition_S(gX)
+        tidxRegs = cute.make_rmem_tensor_like(tidxIndices)
+        cute.autovec_copy(tidxIndices, tidxRegs)
+        tidxValues = tidxRegs.load()
+        tidLocalSum = tidxValues.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
+        rowSum = cute.arch.warp_reduction_sum(tidLocalSum)
+        if lane_idx == 0:
+            gOutput[before_idx, after_idx] = rowSum
 
 
 def benchmark(shape, dim=1, do_bencharmk=False):
