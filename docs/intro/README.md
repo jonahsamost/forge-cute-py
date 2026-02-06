@@ -139,7 +139,7 @@ a = torch.randn(M, N, device="cuda", dtype=torch.float32)
 initial = _invoke_reduce_sum_with_cache(a, dim=-1)
 assert torch.allclose(initial, a.sum(dim=-1), rtol=1e-4, atol=1e-4)
 
-M, N = 1024, 32
+M, N = 256, 256
 b = torch.randn(M, N, device="cuda", dtype=torch.float32)
 after = _invoke_reduce_sum_with_cache(b, dim=-1)
 assert torch.allclose(after, b.sum(dim=-1), rtol=1e-4, atol=1e-4)
@@ -278,21 +278,18 @@ That gap is typically host-side work (Python/CuTe dispatch, conversions such as 
 TVM-FFI is used to help reduce that overhead.
 
 So, let's use it, it couldn't be simpler and it's helpful!
-```
+```python
 @cute.jit
-def reduce_sum_dynamic_stream(x, output, stream=None):
-    num_warps = 4
-    threads_per_block = num_warps * 32
-    M, N = x.shape
-
-    _reduce_sum_kernel(x, output).launch(
-        grid=(M, 1, 1),
-        block=(threads_per_block, 1, 1),
+def our_kernel(x, output, stream=None):
+    ...
+    _reduce_sum_kernel(...).launch(
+        grid=...,
+        block=...,
         stream=stream
     )
 
 fn = cute.compile(
-    reduce_sum_dynamic_stream,
+    our_kernel
     input_cute,
     output_cute,
     cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -373,7 +370,7 @@ def compile_print():
         gx
     )
     fn(gx)
-> compile_print()
+compile_print()
 ...
 gX: tensor<ptr<f32, generic> o ((1,32),(64,1)):((0,1),(32,0))>
 ```

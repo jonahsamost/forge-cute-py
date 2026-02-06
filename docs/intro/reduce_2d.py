@@ -224,5 +224,5 @@ def benchmark(dim=0, is_compositional=True):
     print(f"torch reduce sum dim={dim}: {torch_ms:.3f} ms")
 
 
-# benchmark(dim=0, is_compositional=False)
-# benchmark(dim=-1, is_compositional=False)
+benchmark(dim=0, is_compositional=False)
+benchmark(dim=-1, is_compositional=False)

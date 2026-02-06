@@ -55,7 +55,7 @@ def reduce_sum(x: cute.Tensor, output: cute.Tensor):
     )
 
 @cute.jit
-def reduce_sum_dynamic(x: cute.Tensor, output: cute.Tensor):
+def reduce_sum_dynamic(x, output):
     num_warps = 4
     threads_per_block = num_warps * 32
     M, N = x.shape
