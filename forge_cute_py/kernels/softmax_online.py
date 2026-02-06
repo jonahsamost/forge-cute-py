@@ -1,11 +1,8 @@
-from this import d
 import torch
-import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 from cutlass import BFloat16, Float16, Float32
 from cutlass.cute.runtime import from_dlpack
-from cutlass import const_expr
 
 
 class SoftmaxOnlineBackward:

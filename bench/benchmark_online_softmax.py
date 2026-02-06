@@ -4,7 +4,7 @@ import argparse
 
 import torch
 
-from forge_cute_py.ops.softmax_online import softmax_online, softmax_fwd, softmax_bwd
+from forge_cute_py.ops.softmax_online import softmax_fwd, softmax_bwd
 from forge_cute_py.util.bench import do_bench, estimate_bandwidth, summarize_times
 
 SHORT_M = [128, 512, 2048, 8192]
