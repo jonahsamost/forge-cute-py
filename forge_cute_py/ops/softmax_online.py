@@ -23,6 +23,7 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor, dim: int = -1) -> None:
     # Normalize dim to positive index
     dim = dim if dim >= 0 else x.ndim + dim
     assert dim in [0, 1], f"dim must be 0 or 1 for 2D tensors, got {dim}"
+    assert x.shape[1] % 32 == 0, f"Inner dimension N must be a multiple of 32, got {x.shape[1]}"
 
     dtype_map = {
         torch.float16: Float16,
@@ -87,6 +88,7 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor, dim: 
     # Normalize dim
     dim = dim if dim >= 0 else dy.ndim + dim
     assert dim in [0, 1], f"dim must be 0 or 1 for 2D, got {dim}"
+    assert dy.shape[1] % 32 == 0, f"Inner dimension N must be a multiple of 32, got {dy.shape[1]}"
 
     # Compute gradient (numerically stable)
     # dot_product = (dy * y).sum(dim=dim, keepdim=True)
