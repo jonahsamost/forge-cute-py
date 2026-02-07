@@ -6,6 +6,7 @@ from forge_cute_py.ref import softmax_online as ref_softmax_online
 
 dims = [-1]
 
+
 @pytest.mark.parametrize("shape", [(4, 8), (2, 128)])
 @pytest.mark.parametrize("dim", dims)
 @pytest.mark.parametrize(

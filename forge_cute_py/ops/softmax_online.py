@@ -35,7 +35,7 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor, dim: int = -1) -> None:
         raise ValueError(f"Unsupported dtype: {x.dtype}")
 
     cute_dtype = dtype_map[x.dtype]
-    compile_key = (cute_dtype, x.shape[1]) 
+    compile_key = (cute_dtype, x.shape[1])
 
     if compile_key not in _softmax_fwd.compile_cache:
         m = cute.sym_int()
@@ -53,6 +53,7 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor, dim: int = -1) -> None:
         )
 
     _softmax_fwd.compile_cache[compile_key](x, out)
+
 
 _softmax_fwd.compile_cache = {}
 
@@ -102,7 +103,7 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor, dim: 
     }
 
     cute_dtype = dtype_map[dy.dtype]
-    compile_key = (cute_dtype, dy.shape[1]) 
+    compile_key = (cute_dtype, dy.shape[1])
 
     if compile_key not in _softmax_backward.compile_cache:
         m = cute.sym_int()
@@ -113,13 +114,13 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor, dim: 
         # Compile and cache the kernel
         _softmax_backward.compile_cache[compile_key] = cute.compile(
             SoftmaxOnlineBackward(cute_dtype, n),
-            dy_cute, y_cute, dx_cute,
+            dy_cute,
+            y_cute,
+            dx_cute,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
-    _softmax_backward.compile_cache[compile_key](
-        dy, y, dx
-    )
+    _softmax_backward.compile_cache[compile_key](dy, y, dx)
 
 
 _softmax_backward.compile_cache = {}

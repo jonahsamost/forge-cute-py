@@ -26,7 +26,9 @@ def parse_str_list(s: str) -> list[str]:
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark softmax_online op")
-    parser.add_argument("--long", action="store_true", help="Use long-N benchmark suite (small M, large N)")
+    parser.add_argument(
+        "--long", action="store_true", help="Use long-N benchmark suite (small M, large N)"
+    )
     parser.add_argument("--m-sizes", type=parse_int_list, default=None)
     parser.add_argument("--n-sizes", type=parse_int_list, default=None)
     parser.add_argument("--dtypes", type=parse_str_list, default=DEFAULT_DTYPES)
